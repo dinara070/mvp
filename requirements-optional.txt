@@ -1,0 +1,7 @@
+# Опціональні "production-ready" залежності — потрібні лише якщо активуєте
+# відповідну інтеграцію через .env (див. .env.example). Базовий функціонал
+# застосунку (включно з fallback-режимами AI-модулів) працює й без них.
+
+ldap3>=2.9            # реальний SSO через Active Directory / LDAP (auth.py)
+qdrant-client>=1.9     # справжній векторний пошук замість TF-IDF (vector_store.py)
+psycopg2-binary>=2.9   # підключення до PostgreSQL замість SQLite (див. postgres_schema.sql)
