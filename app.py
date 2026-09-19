@@ -1,10 +1,6 @@
 """
 app.py — "Єдине цифрове вікно співробітника" + "Інтелектуальна база технічних знань"
 
-Запуск:
-    pip install -r requirements.txt
-    streamlit run app.py
-
 Демо-облікові записи (див. seed_data.py):
     ivanenko / 1234      — диспетчер (employee)
     koval    / 1234      — інженер РЗА (employee)
