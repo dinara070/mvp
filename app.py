@@ -1,1687 +1,713 @@
 """
-app.py — "Єдине цифрове вікно співробітника" + "Інтелектуальна база технічних знань"
+Центр моніторингу та безпеки (Security & Operations Dashboard)
+Один файл, Streamlit.
 
-Демо-облікові записи (див. seed_data.py):
-    ivanenko / 1234      — диспетчер (employee)
-    koval    / 1234      — інженер РЗА (employee)
-    petrenko / 1234      — електромонтер (employee)
-    hr_marchenko / 1234  — HR-менеджер (hr)
-    op_bondar / 1234     — інженер з ОП (safety_admin)
-    admin    / admin     — адміністратор системи (admin)
+Запуск:
+    pip install streamlit pandas numpy plotly
+    streamlit run security_ops_dashboard.py
+
+Дані у цій версії СИМУЛЬОВАНІ (генеруються в реальному часі).
+Щоб підключити реальні джерела, замініть функції-провайдери:
+    tick_services(), tick_auth_logs(), tick_servers(), get_backups()
 """
 
-import json
-import datetime as dt
+from __future__ import annotations
 
+from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-import pydeck as pdk
-from streamlit_calendar import calendar as st_calendar
 
-from db import get_conn, init_db, db_empty, now
-from seed_data import seed
-from kb_search import hybrid_search
-import auth
-import audit
-import llm_client
-import rag_chat
-import quiz_generator
-import pdf_reader
-from vector_store import get_active_backend, VECTOR_BACKEND
-
-st.set_page_config(page_title="Цифровий портал співробітника", page_icon="⚡", layout="wide")
-
-# ---------------------------------------------------------------------------
-# Ініціалізація БД
-# ---------------------------------------------------------------------------
-init_db()
-if db_empty():
-    seed()
-
-
-# ---------------------------------------------------------------------------
-# Допоміжні функції
-# ---------------------------------------------------------------------------
-def get_user(login, password):
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT * FROM users WHERE login=? AND password=?", (login, password)
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def get_user_by_id(uid):
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    conn.close()
-    return row
-
-
-ROLE_LABELS = {
-    "employee": "Співробітник",
-    "hr": "HR-менеджер",
-    "safety_admin": "Інженер з ОП",
-    "admin": "Адміністратор",
-}
-
-
-# ---------------------------------------------------------------------------
-# Екран автентифікації (демо-режим АБО реальний LDAP/AD — див. auth.py)
-# ---------------------------------------------------------------------------
-def login_screen():
-    st.title("⚡ Єдиний цифровий портал підприємства")
-    st.caption(f"Режим автентифікації: **{auth.auth_mode_label()}**")
-
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        with st.form("login_form"):
-            st.subheader("Вхід")
-            login = st.text_input("Логін")
-            password = st.text_input("Пароль", type="password")
-            submitted = st.form_submit_button("Увійти", use_container_width=True)
-            if submitted:
-                user, error = auth.authenticate(login, password)
-                if user:
-                    st.session_state["user_id"] = user["id"]
-                    audit.log_action(user, "LOGIN", description=f"Вхід через {auth.auth_mode_label()}")
-                    st.rerun()
-                else:
-                    st.error(error or "Невірний логін або пароль")
-
-    with col2:
-        if auth.is_ldap_configured():
-            st.subheader("Вхід через корпоративний домен")
-            st.info(
-                "Автентифікація виконується реальним BIND-запитом до Active Directory / LDAP "
-                f"({auth.LDAP_SERVER}). Введіть свій робочий логін і пароль домену."
-            )
-        else:
-            st.subheader("Демо-облікові записи")
-            st.markdown(
-                """
-| Логін | Пароль | Роль |
-|---|---|---|
-| `ivanenko` | `1234` | Диспетчер |
-| `koval` | `1234` | Інженер РЗА |
-| `petrenko` | `1234` | Електромонтер |
-| `hr_marchenko` | `1234` | HR-менеджер |
-| `op_bondar` | `1234` | Інженер з ОП |
-| `admin` | `admin` | Адміністратор |
-| `shevchenko` | `1234` | Новий співробітник (адаптація) |
-                """
-            )
-        st.divider()
-        llm_status = "🟢 підключено" if llm_client.is_llm_configured() else "⚪ fallback-режим (без LLM)"
-        vec_status = "Qdrant" if VECTOR_BACKEND == "qdrant" else "TF-IDF (вбудований)"
-        st.caption(f"AI-асистент: {llm_status} · Векторний пошук: {vec_status}")
-
-
-# ---------------------------------------------------------------------------
-# Модуль 1: Кадровий кабінет та табелювання
-# ---------------------------------------------------------------------------
-SHIFT_COLORS = {
-    "08:00–20:00": "#2E7D32",
-    "20:00–08:00": "#1565C0",
-    "09:00–18:00": "#6A1B9A",
-}
-
-
-def page_schedule(user):
-    st.subheader("🗓️ Розклад змін та табелювання")
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT work_date, shift, location FROM schedules WHERE user_id=? ORDER BY work_date",
-        (user["id"],)
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        st.info("Для вас поки не заплановано змін.")
-        return
-
-    events = []
-    for r in rows:
-        color = "#455A64"
-        for prefix, c in SHIFT_COLORS.items():
-            if r["shift"].startswith(prefix):
-                color = c
-                break
-        events.append({
-            "title": f"{r['shift']} · {r['location']}",
-            "start": r["work_date"],
-            "end": r["work_date"],
-            "color": color,
-            "allDay": True,
-        })
-
-    calendar_options = {
-        "headerToolbar": {
-            "left": "prev,next today",
-            "center": "title",
-            "right": "dayGridMonth,listMonth",
-        },
-        "initialView": "dayGridMonth",
-        "height": 650,
-        "locale": "uk",
-        "firstDay": 1,
-    }
-    st_calendar(events=events, options=calendar_options, key=f"cal_{user['id']}")
-
-    with st.expander("Показати у вигляді таблиці (для друку / експорту)"):
-        st.dataframe(
-            [{"Дата": r["work_date"], "Зміна": r["shift"], "Локація": r["location"]} for r in rows],
-            use_container_width=True, hide_index=True,
-        )
-
-
-def page_certificates(user):
-    st.subheader("📄 Замовлення довідок")
-    with st.form("cert_form"):
-        cert_type = st.selectbox("Тип довідки", ["З місця роботи", "Про доходи"])
-        submitted = st.form_submit_button("Замовити довідку")
-        if submitted:
-            conn = get_conn()
-            conn.execute(
-                "INSERT INTO certificate_requests (user_id, cert_type, status, created_at) VALUES (?,?,?,?)",
-                (user["id"], cert_type, "В обробці", now())
-            )
-            conn.commit()
-            conn.close()
-            st.success(f"Заявку на довідку «{cert_type}» подано.")
-            st.rerun()
-
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT cert_type, status, created_at FROM certificate_requests WHERE user_id=? ORDER BY id DESC",
-        (user["id"],)
-    ).fetchall()
-    conn.close()
-    st.markdown("**Мої заявки:**")
-    if rows:
-        st.dataframe(
-            [{"Тип": r["cert_type"], "Статус": r["status"], "Дата": r["created_at"]} for r in rows],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.caption("Заявок ще немає.")
-
-
-def page_leave(user):
-    st.subheader("🏖️ Заява на відпустку / відгул")
-    conn = get_conn()
-    approvers = conn.execute(
-        "SELECT full_name FROM users WHERE department=? AND id!=?",
-        (user["department"], user["id"])
-    ).fetchall()
-    conn.close()
-    approver_names = [a["full_name"] for a in approvers] or ["Керівник підрозділу"]
-
-    with st.form("leave_form"):
-        req_type = st.selectbox("Тип заяви", ["Відпустка", "Відгул"])
-        c1, c2 = st.columns(2)
-        date_from = c1.date_input("Дата з", dt.date.today())
-        date_to = c2.date_input("Дата по", dt.date.today())
-        approver = st.selectbox("Погоджувач (електронний підбір за підрозділом)", approver_names)
-        comment = st.text_area("Коментар (необов'язково)")
-        submitted = st.form_submit_button("Подати заяву")
-        if submitted:
-            if date_to < date_from:
-                st.error("Дата «по» не може бути раніше дати «з».")
-            else:
-                conn = get_conn()
-                conn.execute(
-                    "INSERT INTO leave_requests (user_id, req_type, date_from, date_to, comment, approver, status, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (user["id"], req_type, date_from.isoformat(), date_to.isoformat(),
-                     comment, approver, "На розгляді", now())
-                )
-                conn.commit()
-                conn.close()
-                st.success(f"Заяву на {req_type.lower()} подано на погодження до {approver}.")
-                st.rerun()
-
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT req_type, date_from, date_to, approver, status FROM leave_requests WHERE user_id=? ORDER BY id DESC",
-        (user["id"],)
-    ).fetchall()
-    conn.close()
-    st.markdown("**Мої заяви:**")
-    if rows:
-        st.dataframe(
-            [{"Тип": r["req_type"], "З": r["date_from"], "По": r["date_to"],
-              "Погоджувач": r["approver"], "Статус": r["status"]} for r in rows],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.caption("Заяв ще немає.")
-
-
-def page_notifications(user):
-    st.subheader("🔔 Корпоративний дайджест та сповіщення")
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM notifications ORDER BY id DESC").fetchall()
-    conn.close()
-    for r in rows:
-        targeted = r["department"] and r["department"] != user["department"]
-        if targeted:
-            continue  # таргетована розсилка — показуємо лише релевантні філії/підрозділи
-        icon = "🚨" if r["urgent"] else "📢"
-        with st.container(border=True):
-            st.markdown(f"{icon} **{r['title']}**  \n{r['body']}")
-            scope = r["branch"] or r["department"] or "Усі філії"
-            st.caption(f"{scope} · {r['created_at']}")
-
-
-# ---------------------------------------------------------------------------
-# Модуль 3 (розширення): Заявки на обладнання / ЗІЗ
-# ---------------------------------------------------------------------------
-EQUIPMENT_TYPES = ["Спецодяг/ЗІЗ", "Інструмент", "Несправність обладнання"]
-
-
-def page_equipment_requests(user):
-    st.subheader("🧰 Заявки на обладнання / ЗІЗ")
-    st.caption("Замовлення спецодягу, інструменту або повідомлення про несправність обладнання.")
-
-    with st.form("equipment_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        rtype = c1.selectbox("Тип заявки", EQUIPMENT_TYPES)
-        qty = c2.number_input("Кількість", min_value=1, value=1, step=1)
-        item = st.text_input("Найменування (напр. «Каска захисна», «Діелектричні рукавички розмір 10»)")
-        desc = st.text_area("Опис / причина заявки (для несправності — опишіть проблему)")
-        priority = st.selectbox(
-            "Пріоритет", ["Звичайна", "Термінова"],
-            help="Термінова — якщо несправність або відсутність ЗІЗ унеможливлює безпечне виконання робіт."
-        )
-        submitted = st.form_submit_button("Подати заявку", use_container_width=True)
-        if submitted:
-            if not item.strip():
-                st.warning("Вкажіть найменування обладнання/ЗІЗ.")
-            else:
-                conn = get_conn()
-                conn.execute(
-                    "INSERT INTO equipment_requests (user_id, request_type, item_name, quantity, description, "
-                    "priority, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                    (user["id"], rtype, item, int(qty), desc, priority, "Подано", now())
-                )
-                conn.commit()
-                conn.close()
-                st.success("Заявку подано.")
-                st.rerun()
-
-    conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM equipment_requests WHERE user_id=? ORDER BY id DESC", (user["id"],)
-    ).fetchall()
-    conn.close()
-
-    st.markdown("**Мої заявки:**")
-    if not rows:
-        st.caption("Заявок ще немає.")
-        return
-    for r in rows:
-        icon = "🚨" if r["priority"] == "Термінова" else "📦"
-        status_icon = {"Подано": "🕓", "На розгляді": "🔎", "Видано/Виконано": "✅", "Відхилено": "❌"}.get(r["status"], "🕓")
-        with st.container(border=True):
-            st.markdown(f"{icon} **{r['item_name']}** ({r['request_type']}, шт: {r['quantity']}) {status_icon} {r['status']}")
-            if r["description"]:
-                st.caption(r["description"])
-            st.caption(f"Пріоритет: {r['priority']} · Подано: {r['created_at']}")
-
-
-# ---------------------------------------------------------------------------
-# Модуль 3 (розширення): Адаптація (Onboarding) для новачків
-# ---------------------------------------------------------------------------
-def page_onboarding(user):
-    st.subheader("🧭 Програма адаптації нового співробітника")
-    conn = get_conn()
-    tasks = conn.execute(
-        "SELECT * FROM onboarding_tasks WHERE user_id=? ORDER BY order_index", (user["id"],)
-    ).fetchall()
-
-    if not tasks:
-        st.info("Для вас не сформовано персонального плану адаптації.")
-        conn.close()
-        return
-
-    total = len(tasks)
-    done = sum(1 for t in tasks if t["status"] == "Виконано")
-    st.progress(done / total, text=f"Виконано {done} з {total} кроків")
-
-    icons = {"Інструктаж": "🦺", "Регламент": "📄", "Ментор": "🤝", "Інше": "📌"}
-
-    unlocked = True  # перший крок завжди доступний, далі — послідовно (ланцюжок завдань)
-    for t in tasks:
-        is_done = t["status"] == "Виконано"
-
-        # авто-перевірка для завдань типу "Інструктаж": зараховано, якщо тест складено
-        if not is_done and t["task_type"] == "Інструктаж" and t["related_instruction_id"]:
-            passed = conn.execute(
-                "SELECT 1 FROM test_results WHERE user_id=? AND instruction_id=? AND passed=1",
-                (user["id"], t["related_instruction_id"])
-            ).fetchone()
-            if passed:
-                conn.execute(
-                    "UPDATE onboarding_tasks SET status='Виконано', completed_at=? WHERE id=?",
-                    (now(), t["id"])
-                )
-                conn.commit()
-                is_done = True
-
-        label = f"{icons.get(t['task_type'], '📌')} Крок {t['order_index']}: {t['title']}"
-        with st.container(border=True):
-            if is_done:
-                st.markdown(f"✅ ~~{label}~~")
-            elif unlocked:
-                st.markdown(f"**{label}**")
-            else:
-                st.markdown(f"🔒 {label}")
-                st.caption("Доступно після виконання попереднього кроку.")
-                continue
-
-            st.write(t["description"] or "")
-
-            if not is_done and unlocked:
-                if t["task_type"] == "Інструктаж" and t["related_instruction_id"]:
-                    instr = conn.execute(
-                        "SELECT * FROM safety_instructions WHERE id=?", (t["related_instruction_id"],)
-                    ).fetchone()
-                    with st.expander("Перейти до інструктажу та тестування"):
-                        st.write(instr["content"])
-                        st.caption("Пройдіть тест у розділі «Інструктажі та ОП» — крок буде зараховано автоматично.")
-                elif t["task_type"] == "Регламент" and t["related_document_id"]:
-                    doc = conn.execute(
-                        "SELECT * FROM kb_documents WHERE id=?", (t["related_document_id"],)
-                    ).fetchone()
-                    with st.expander(f"Відкрити документ: {doc['title']}"):
-                        st.write(doc["content"])
-                    if st.button("Позначити ознайомленим(ою)", key=f"onb_{t['id']}"):
-                        conn.execute(
-                            "UPDATE onboarding_tasks SET status='Виконано', completed_at=? WHERE id=?",
-                            (now(), t["id"])
-                        )
-                        conn.commit()
-                        st.rerun()
-                elif t["task_type"] == "Ментор":
-                    if t["mentor_name"]:
-                        st.caption(f"Ментор: **{t['mentor_name']}**")
-                    if st.button("Зустріч відбулася", key=f"onb_{t['id']}"):
-                        conn.execute(
-                            "UPDATE onboarding_tasks SET status='Виконано', completed_at=? WHERE id=?",
-                            (now(), t["id"])
-                        )
-                        conn.commit()
-                        st.rerun()
-                else:
-                    if st.button("Позначити виконаним", key=f"onb_{t['id']}"):
-                        conn.execute(
-                            "UPDATE onboarding_tasks SET status='Виконано', completed_at=? WHERE id=?",
-                            (now(), t["id"])
-                        )
-                        conn.commit()
-                        st.rerun()
-
-        if not is_done:
-            unlocked = False  # наступний крок заблокований, доки цей не виконано
-
-    conn.close()
-    if done == total:
-        st.success("🎉 Програму адаптації повністю пройдено!")
-
-
-# ---------------------------------------------------------------------------
-# Модуль 1 (продовження): Техніка безпеки та охорона праці
-# ---------------------------------------------------------------------------
-def page_safety(user):
-    st.subheader("🦺 Інструктажі з техніки безпеки та тестування")
-
-    conn = get_conn()
-    instructions = conn.execute(
-        "SELECT * FROM safety_instructions WHERE required_for_role IN ('Усі', ?) ",
-        (user["position"],)
-    ).fetchall()
-
-    for instr in instructions:
-        last = conn.execute(
-            "SELECT * FROM test_results WHERE user_id=? AND instruction_id=? ORDER BY taken_at DESC LIMIT 1",
-            (user["id"], instr["id"])
-        ).fetchone()
-
-        status = "🔴 Не пройдено"
-        if last:
-            days_since = (dt.date.today() - dt.datetime.strptime(last["taken_at"], "%Y-%m-%d %H:%M").date()).days
-            if last["passed"] and days_since <= instr["valid_days"]:
-                status = f"🟢 Пройдено ({last['score']:.0f}%), дійсно ще {instr['valid_days'] - days_since} дн."
-            elif last["passed"]:
-                status = "🟡 Термін дії сплив — потрібно перепройти"
-            else:
-                status = f"🔴 Останній результат: {last['score']:.0f}% (не зараховано)"
-
-        with st.expander(f"{instr['title']} — {status}"):
-            st.caption(f"Категорія: {instr['category']}")
-            st.write(instr["content"])
-
-            questions = conn.execute(
-                "SELECT * FROM quiz_questions WHERE instruction_id=?", (instr["id"],)
-            ).fetchall()
-
-            if questions:
-                with st.form(f"quiz_{instr['id']}"):
-                    st.markdown("**Контрольне тестування**")
-                    answers = {}
-                    for q in questions:
-                        opts = json.loads(q["options"])
-                        answers[q["id"]] = st.radio(q["question"], opts, key=f"q_{instr['id']}_{q['id']}", index=None)
-                    go = st.form_submit_button("Здати тест")
-                    if go:
-                        if any(v is None for v in answers.values()):
-                            st.warning("Дайте відповідь на всі питання.")
-                        else:
-                            correct = 0
-                            for q in questions:
-                                opts = json.loads(q["options"])
-                                if opts.index(answers[q["id"]]) == q["correct_index"]:
-                                    correct += 1
-                            score = correct / len(questions) * 100
-                            passed = score >= 70
-                            conn.execute(
-                                "INSERT INTO test_results (user_id, instruction_id, score, passed, taken_at) "
-                                "VALUES (?,?,?,?,?)",
-                                (user["id"], instr["id"], score, int(passed), now())
-                            )
-                            conn.commit()
-                            audit.log_action(
-                                user, "TAKE_TEST", object_type="safety_instruction", object_id=instr["id"],
-                                description=f"Тест «{instr['title']}»: результат {score:.0f}%, "
-                                            f"{'зараховано' if passed else 'не зараховано'}"
-                            )
-                            if passed:
-                                st.success(f"Тест зараховано! Результат: {score:.0f}%. "
-                                           "Результат зафіксовано в системі для аудиту Держпраці.")
-                            else:
-                                st.error(f"Тест не зараховано ({score:.0f}%). Мінімум для зарахування — 70%.")
-                            st.rerun()
-            else:
-                st.caption("Для цього інструктажу тестові питання ще не додано.")
-
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Модуль 2: Інтелектуальна база технічних знань
-# ---------------------------------------------------------------------------
-def page_knowledge_base(user):
-    st.subheader("📚 Інтелектуальна база технічних знань")
-    backend = get_active_backend()
-    st.caption(
-        f"Гібридний пошук: **{backend.name}**. Показані лише документи, доступні за вашим рівнем допуску."
-    )
-
-    conn = get_conn()
-    all_docs = conn.execute("SELECT * FROM kb_documents").fetchall()
-    conn.close()
-
-    docs = [d for d in all_docs if d["min_access_level"] <= user["access_level"]]
-    hidden_count = len(all_docs) - len(docs)
-
-    categories = ["Усі"] + sorted({d["category"] for d in docs if d["category"]})
-
-    c1, c2 = st.columns([3, 1])
-    query = c1.text_input(
-        "Пошуковий запит природною мовою",
-        placeholder='напр. "Який порядок підключення генератора при аварії на підстанції 110кВ?"'
-    )
-    category = c2.selectbox("Категорія", categories)
-
-    results = backend.search(query, docs, category=category)
-
-    if hidden_count:
-        st.caption(f"🔒 Ще {hidden_count} документ(и) приховано — недостатній рівень допуску "
-                   f"(поточний: {user['access_level']}).")
-
-    if not results:
-        st.info("Нічого не знайдено. Спробуйте переформулювати запит.")
-        return
-
-    for r in results:
-        d = r["doc"]
-        score_label = f" · релевантність {r['score']*100:.0f}%" if r["score"] is not None else ""
-        with st.container(border=True):
-            st.markdown(f"**{d['title']}**  \n`{d['category']}`{score_label}")
-            st.write(f"💡 {r['snippet']}")
-            if st.button("📄 Показати повний текст документа", key=f"view_doc_{d['id']}"):
-                audit.log_action(
-                    user, "VIEW_DOCUMENT", object_type="kb_document", object_id=d["id"],
-                    description=f"Перегляд документа «{d['title']}» (рівень допуску {d['min_access_level']})"
-                )
-                st.session_state[f"show_doc_{d['id']}"] = True
-            if st.session_state.get(f"show_doc_{d['id']}"):
-                st.write(d["content"])
-            st.caption(f"Власник: {d['owner']} · Оновлено: {d['updated_at']} · "
-                       f"Мін. рівень допуску: {d['min_access_level']}")
-
-
-# ---------------------------------------------------------------------------
-# Модуль 1 (AI/RAG): чат-асистент технічної підтримки
-# ---------------------------------------------------------------------------
-ROLE_QUICK_QUESTIONS = {
-    "employee": [
-        "Який порядок дій при аварії на трансформаторі Т-2?",
-        "Які вимоги до ЗІЗ при роботі на підстанції 110кВ?",
-        "Як подати заяву на відпустку?",
-    ],
-    "hr": [
-        "Який порядок оформлення відпустки та відгулу?",
-        "Які документи потрібні для довідки про доходи?",
-        "Який порядок проведення вступного інструктажу для новачків?",
-    ],
-    "safety_admin": [
-        "Яка періодичність проходження інструктажів з ОП?",
-        "Який порядок дій при нещасному випадку на виробництві?",
-        "Вимоги НПАОП до допуску персоналу на електроустановках",
-    ],
-    "admin": [
-        "Який порядок підключення резервного генератора при аварії на ПС 110кВ?",
-        "Який порядок оформлення відпустки?",
-        "Яка періодичність тестування з охорони праці?",
-    ],
-}
-
-
-def page_rag_chat(user):
-    st.subheader("🤖 Чат-асистент технічної підтримки (RAG)")
-
-    llm_on = llm_client.is_llm_configured()
-    try:
-        backend = get_active_backend()
-        backend_name = backend.name
-    except Exception:
-        backend = None
-        backend_name = "TF-IDF (вбудований, fallback)"
-
-    if llm_on:
-        st.caption(f"LLM підключено (модель: {llm_client.OPENAI_CHAT_MODEL}) · Пошук: {backend_name}")
-    else:
-        st.warning(
-            "LLM не налаштована (немає OPENAI_API_KEY / локальної Ollama) — асистент відповідає "
-            "у fallback-режимі: показує найрелевантніші фрагменти з бази знань без узагальнення. "
-            "Див. `.env.example` для підключення LLM.",
-            icon="⚪",
-        )
-
-    conn = get_conn()
-    all_docs = conn.execute("SELECT * FROM kb_documents").fetchall()
-    conn.close()
-    accessible_docs = [d for d in all_docs if d["min_access_level"] <= user["access_level"]]
-    hidden_count = len(all_docs) - len(accessible_docs)
-
-    st.caption(
-        f"🔎 Пошук серед {len(accessible_docs)} доступних вам документів бази знань"
-        + (f" (ще {hidden_count} приховано за рівнем допуску)" if hidden_count else "")
-    )
-
-    history_key = f"chat_history_{user['id']}"
-    if history_key not in st.session_state:
-        # відновлюємо останні повідомлення з БД, щоб історія не губилась при перезаході в застосунок
-        conn = get_conn()
-        past = conn.execute(
-            "SELECT question, answer, sources FROM chat_history WHERE user_id=? ORDER BY id DESC LIMIT 10",
-            (user["id"],)
-        ).fetchall()
-        conn.close()
-        restored = []
-        for row in reversed(past):
-            restored.append({"role": "user", "content": row["question"]})
-            try:
-                srcs = json.loads(row["sources"]) if row["sources"] else []
-            except (json.JSONDecodeError, TypeError):
-                srcs = []
-            restored.append({"role": "assistant", "content": row["answer"], "sources": srcs})
-        st.session_state[history_key] = restored
-
-    if not st.session_state[history_key]:
-        st.caption("💡 Приклади запитань для вашої ролі:")
-        quick_questions = ROLE_QUICK_QUESTIONS.get(user["role"], ROLE_QUICK_QUESTIONS["employee"])
-        cols = st.columns(len(quick_questions))
-        for col, q in zip(cols, quick_questions):
-            if col.button(q, key=f"quick_{hash(q)}", use_container_width=True):
-                st.session_state[f"pending_question_{user['id']}"] = q
-                st.rerun()
-
-    for msg in st.session_state[history_key]:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-            if msg.get("sources"):
-                st.caption("📎 Джерела: " + ", ".join(msg["sources"]))
-
-    pending_key = f"pending_question_{user['id']}"
-    question = st.chat_input('Напр. «Який порядок дій при аварії на трансформаторі Т-2?»')
-    if not question and st.session_state.get(pending_key):
-        question = st.session_state.pop(pending_key)
-
-    if question:
-        st.session_state[history_key].append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.write(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Шукаю в базі знань і формую відповідь..."):
-                try:
-                    result = rag_chat.answer_query(
-                        question, accessible_docs, user=user, hidden_count=hidden_count
-                    )
-                except Exception as e:
-                    result = {
-                        "answer": f"⚠️ Сталася технічна помилка при обробці запиту ({e}). "
-                                  f"Спробуйте ще раз або переформулюйте питання.",
-                        "sources": [], "llm_used": False,
-                    }
-            st.write(result["answer"])
-            if result["sources"]:
-                st.caption("📎 Джерела: " + ", ".join(result["sources"]))
-
-        st.session_state[history_key].append({
-            "role": "assistant", "content": result["answer"], "sources": result["sources"]
-        })
-
-        conn = get_conn()
-        conn.execute(
-            "INSERT INTO chat_history (user_id, question, answer, sources, llm_used, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (user["id"], question, result["answer"], json.dumps(result["sources"], ensure_ascii=False),
-             int(result["llm_used"]), now())
-        )
-        conn.commit()
-        conn.close()
-
-        audit.log_action(
-            user, "CHAT_QUERY", object_type="chat_history",
-            description=f"Запит до RAG-асистента: «{question[:200]}» (LLM: {result['llm_used']})"
-        )
-        st.rerun()
-
-    if st.session_state[history_key] and st.button("🗑️ Очистити історію чату"):
-        st.session_state[history_key] = []
-        st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Модуль 4: Енергетична та диспетчерська специфіка (обленерго/енергокомпанії)
-# ---------------------------------------------------------------------------
-
-STATUS_COLOR = {
-    "В роботі": [46, 160, 67],           # зелений
-    "Планове відключення": [230, 168, 23],  # жовтий
-    "Аварія": [217, 45, 32],              # червоний
-}
-
-EVENT_TYPES = ["Аварійне відключення", "Планове відключення", "Спрацювання захисту", "Виїзд ОВБ", "Інше"]
-
-
-def page_operational_log(user):
-    """Журнал оперативних розпоряджень / аварійних заяв для диспетчерів та бригад ОВБ."""
-    st.subheader("📒 Журнал оперативних розпоряджень та аварійних заяв")
-    st.caption("Фіксація оперативних подій, відключень та виїздів оперативно-виїзних бригад (ОВБ) у реальному часі.")
-
-    conn = get_conn()
-    substations = conn.execute("SELECT * FROM substations ORDER BY name").fetchall()
-    sub_options = {s["name"]: s["id"] for s in substations}
-
-    with st.form("new_log_entry", clear_on_submit=True):
-        st.markdown("**Новий запис**")
-        c1, c2 = st.columns(2)
-        sub_name = c1.selectbox("Підстанція / об'єкт", list(sub_options.keys()))
-        event_type = c2.selectbox("Тип події", EVENT_TYPES)
-        description = st.text_area("Опис оперативної події / розпорядження")
-        brigade = st.text_input("Бригада ОВБ (склад/номер)", value="")
-        submitted = st.form_submit_button("Зафіксувати подію", use_container_width=True)
-        if submitted:
-            if not description.strip():
-                st.warning("Опишіть подію перед збереженням.")
-            else:
-                conn.execute(
-                    "INSERT INTO operational_log (user_id, substation_id, event_type, description, status, brigade, created_at, resolved_at) "
-                    "VALUES (?,?,?,?,?,?,?,?)",
-                    (user["id"], sub_options[sub_name], event_type, description, "Відкрито",
-                     brigade or None, now(), None)
-                )
-                # аварійна подія одразу відображається на статусі підстанції на карті
-                if event_type in ("Аварійне відключення", "Спрацювання захисту"):
-                    conn.execute("UPDATE substations SET status='Аварія' WHERE id=?", (sub_options[sub_name],))
-                elif event_type == "Планове відключення":
-                    conn.execute("UPDATE substations SET status='Планове відключення' WHERE id=?", (sub_options[sub_name],))
-                conn.commit()
-                st.success("Подію зафіксовано в журналі.")
-                st.rerun()
-
-    st.divider()
-    st.markdown("**Стрічка подій**")
-
-    c1, c2 = st.columns(2)
-    status_filter = c1.selectbox("Фільтр за статусом", ["Усі", "Відкрито", "В роботі", "Закрито"])
-    branch_filter = c2.selectbox(
-        "Фільтр за філією",
-        ["Усі"] + sorted({s["branch"] for s in substations if s["branch"]})
-    )
-
-    query = (
-        "SELECT ol.*, s.name AS sub_name, s.branch AS sub_branch, u.full_name AS author "
-        "FROM operational_log ol "
-        "LEFT JOIN substations s ON s.id = ol.substation_id "
-        "JOIN users u ON u.id = ol.user_id "
-        "ORDER BY ol.id DESC"
-    )
-    rows = conn.execute(query).fetchall()
-
-    for r in rows:
-        if status_filter != "Усі" and r["status"] != status_filter:
-            continue
-        if branch_filter != "Усі" and r["sub_branch"] != branch_filter:
-            continue
-
-        icon = {"Аварійне відключення": "🚨", "Планове відключення": "🛠️",
-                "Спрацювання захисту": "⚡", "Виїзд ОВБ": "🚐", "Інше": "📝"}.get(r["event_type"], "📝")
-        with st.container(border=True):
-            sub_label = r["sub_name"] or "без прив'язки до об'єкта"
-            st.markdown(f"{icon} **{r['event_type']}** · {sub_label}")
-            st.write(r["description"])
-            meta = f"Автор: {r['author']}"
-            if r["brigade"]:
-                meta += f" · Бригада: {r['brigade']}"
-            meta += f" · {r['created_at']} · Статус: **{r['status']}**"
-            st.caption(meta)
-
-            if r["status"] != "Закрито":
-                bc1, bc2 = st.columns(2)
-                if r["status"] == "Відкрито" and bc1.button("Взяти в роботу", key=f"work_{r['id']}"):
-                    conn.execute("UPDATE operational_log SET status='В роботі' WHERE id=?", (r["id"],))
-                    conn.commit()
-                    st.rerun()
-                if bc2.button("Закрити подію", key=f"close_{r['id']}"):
-                    conn.execute(
-                        "UPDATE operational_log SET status='Закрито', resolved_at=? WHERE id=?",
-                        (now(), r["id"])
-                    )
-                    if r["substation_id"]:
-                        conn.execute("UPDATE substations SET status='В роботі' WHERE id=?", (r["substation_id"],))
-                    conn.commit()
-                    st.rerun()
-
-    conn.close()
-
-
-def page_substations_map(user):
-    """Карта підстанцій (pydeck) з прив'язаними паспортами/схемами/інструкціями з бази знань."""
-    st.subheader("🗺️ Карта підстанцій")
-    st.caption(
-        "Геодані об'єктів мережі (pydeck). Оберіть підстанцію нижче, щоб побачити прив'язані документи "
-        "з бази знань та останні оперативні події по ній."
-    )
-
-    conn = get_conn()
-    substations = conn.execute("SELECT * FROM substations ORDER BY name").fetchall()
-    conn.close()
-    if not substations:
-        st.info("Підстанції ще не додані в систему.")
-        return
-
-    data = [
-        {
-            "name": s["name"],
-            "branch": s["branch"],
-            "voltage_class": s["voltage_class"],
-            "status": s["status"],
-            "lat": s["latitude"],
-            "lon": s["longitude"],
-            "color": STATUS_COLOR.get(s["status"], [100, 100, 100]),
+# ----------------------------------------------------------------------------
+# Налаштування сторінки
+# ----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Центр моніторингу та безпеки",
+    page_icon="🛡️",
+    layout="wide",
+)
+
+# ----------------------------------------------------------------------------
+# Константи та довідники
+# ----------------------------------------------------------------------------
+SERVICES = [
+    "Біллінгова система",
+    "Єдина база абонентів",
+    "Корпоративна пошта",
+    "Внутрішні сервери",
+]
+
+SERVERS = ["SRV-BILLING-01", "SRV-DB-01", "SRV-MAIL-01", "SRV-APP-01", "SRV-FILE-01"]
+
+BACKUP_JOBS = [
+    ("Біллінг — повний", "SRV-BILLING-01", 26),
+    ("База абонентів — інкрементальний", "SRV-DB-01", 6),
+    ("Пошта — повний", "SRV-MAIL-01", 26),
+    ("Файловий сервер — повний", "SRV-FILE-01", 26),
+    ("Застосунки — знімок ВМ", "SRV-APP-01", 26),
+]
+
+# Співробітники: (логін, місто, країна, lat, lon, IP)
+EMPLOYEES = [
+    ("o.kovalenko", "Київ", "Україна", 50.45, 30.52, "91.203.14.21"),
+    ("i.melnyk", "Львів", "Україна", 49.84, 24.03, "91.203.22.87"),
+    ("m.shevchenko", "Ужгород", "Україна", 48.62, 22.29, "91.203.31.5"),
+    ("a.bondar", "Одеса", "Україна", 46.48, 30.73, "91.203.40.113"),
+    ("v.tkachenko", "Харків", "Україна", 49.99, 36.23, "91.203.55.9"),
+    ("n.kravchenko", "Дніпро", "Україна", 48.46, 35.05, "91.203.61.140"),
+    ("d.oliynyk", "Київ", "Україна", 50.45, 30.52, "91.203.14.77"),
+    ("s.moroz", "Львів", "Україна", 49.84, 24.03, "91.203.22.19"),
+]
+
+# Зовнішні (підозрілі) джерела: (місто, країна, lat, lon, IP)
+EXTERNAL = [
+    ("Амстердам", "Нідерланди", 52.37, 4.90, "185.220.101.34"),
+    ("Франкфурт", "Німеччина", 50.11, 8.68, "45.153.160.12"),
+    ("Сінгапур", "Сінгапур", 1.35, 103.82, "103.253.145.8"),
+    ("Сан-Паулу", "Бразилія", -23.55, -46.63, "177.54.144.90"),
+    ("Ешберн", "США", 39.04, -77.49, "34.201.55.170"),
+    ("Ханой", "В'єтнам", 21.03, 105.85, "14.161.30.66"),
+    ("Лагос", "Нігерія", 6.52, 3.38, "197.210.55.4"),
+]
+
+ATTACK_USERNAMES = ["admin", "root", "administrator", "billing", "postmaster", "test", "support"]
+ACCESS_SYSTEMS = ["VPN", "Біллінг", "Пошта", "Адмін-панель", "SSH"]
+
+STATUS_OK, STATUS_WARN, STATUS_DOWN = "Працює", "Деградація", "Недоступний"
+STATUS_COLOR = {STATUS_OK: "#22c55e", STATUS_WARN: "#f59e0b", STATUS_DOWN: "#ef4444"}
+STATUS_ICON = {STATUS_OK: "🟢", STATUS_WARN: "🟡", STATUS_DOWN: "🔴"}
+
+MAX_LOG_ROWS = 3000
+MAX_HISTORY = 90
+
+
+# ----------------------------------------------------------------------------
+# Симуляція даних (замініть на реальні джерела)
+# ----------------------------------------------------------------------------
+def _make_event(rng: np.random.Generator, ts: datetime, attacker: tuple | None = None) -> dict:
+    """Одна подія авторизації."""
+    if attacker is not None:
+        city, country, lat, lon, ip = attacker
+        return {
+            "time": ts,
+            "user": str(rng.choice(ATTACK_USERNAMES)),
+            "ip": ip,
+            "city": city,
+            "country": country,
+            "lat": lat,
+            "lon": lon,
+            "system": str(rng.choice(["VPN", "SSH", "Адмін-панель"])),
+            # дуже мала ймовірність, що підбір вдався
+            "result": "Успішно" if rng.random() < 0.004 else "Невдало",
         }
-        for s in substations
+
+    # звичайна активність співробітників
+    if rng.random() < 0.03:  # вхід із «дивної» геолокації
+        city, country, lat, lon, ip = EXTERNAL[rng.integers(len(EXTERNAL))]
+        user = EMPLOYEES[rng.integers(len(EMPLOYEES))][0]
+    else:
+        user, city, country, lat, lon, ip = EMPLOYEES[rng.integers(len(EMPLOYEES))]
+    return {
+        "time": ts,
+        "user": user,
+        "ip": ip,
+        "city": city,
+        "country": country,
+        "lat": lat,
+        "lon": lon,
+        "system": str(rng.choice(ACCESS_SYSTEMS)),
+        "result": "Успішно" if rng.random() < 0.93 else "Невдало",
+    }
+
+
+def init_state() -> None:
+    """Початкова ініціалізація симуляції."""
+    if "initialized" in st.session_state:
+        return
+
+    rng = np.random.default_rng()
+    ss = st.session_state
+    ss.rng = rng
+    ss.attack_ticks = 0
+    ss.attacker = None
+
+    # --- Сервіси
+    ss.services = {
+        name: {
+            "status": STATUS_OK,
+            "latency": float(rng.uniform(20, 80)),
+            "uptime": float(rng.uniform(99.6, 99.99)),
+            "since": datetime.now(),
+        }
+        for name in SERVICES
+    }
+
+    # --- Логи авторизації за останню годину
+    now = datetime.now()
+    events = [
+        _make_event(rng, now - timedelta(seconds=int(s)))
+        for s in sorted(rng.uniform(0, 3600, 220), reverse=True)
     ]
+    ss.logs = pd.DataFrame(events)
 
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=data,
-        get_position="[lon, lat]",
-        get_fill_color="color",
-        get_radius=350,
-        radius_min_pixels=8,
-        radius_max_pixels=40,
-        pickable=True,
-        stroked=True,
-        get_line_color=[255, 255, 255],
-        line_width_min_pixels=1,
+    # --- Сервери
+    ss.servers = {
+        s: {
+            "cpu": float(rng.uniform(20, 55)),
+            "ram": float(rng.uniform(40, 70)),
+            "disk": float(rng.uniform(45, 80)),
+            "net": float(rng.uniform(50, 400)),
+        }
+        for s in SERVERS
+    }
+    ss.cpu_hist = pd.DataFrame(
+        {s: [ss.servers[s]["cpu"]] for s in SERVERS}, index=[now]
     )
-    view_state = pdk.ViewState(
-        latitude=sum(d["lat"] for d in data) / len(data),
-        longitude=sum(d["lon"] for d in data) / len(data),
-        zoom=10, pitch=0,
+    ss.ram_hist = pd.DataFrame(
+        {s: [ss.servers[s]["ram"]] for s in SERVERS}, index=[now]
     )
-    deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view_state,
-        map_style=None,  # без стороннього API-ключа для мап; використовується вбудований стиль
-        tooltip={"text": "{name}\n{voltage_class} · {status}\nФілія: {branch}"},
-    )
-    st.pydeck_chart(deck, use_container_width=True)
 
-    legend_cols = st.columns(len(STATUS_COLOR))
-    for col, (label, color) in zip(legend_cols, STATUS_COLOR.items()):
-        col.markdown(
-            f"<span style='color:rgb{tuple(color)}'>●</span> {label}", unsafe_allow_html=True
+    # --- Бекапи
+    backups = []
+    for name, host, max_age_h in BACKUP_JOBS:
+        backups.append(
+            {
+                "Завдання": name,
+                "Сервер": host,
+                "Останній запуск": now - timedelta(hours=float(rng.uniform(1, max_age_h - 3))),
+                "Статус": "Успішно",
+                "Розмір, ГБ": round(float(rng.uniform(20, 900)), 1),
+                "Тривалість, хв": int(rng.integers(8, 95)),
+                "Макс. вік, год": max_age_h,
+            }
+        )
+    ss.backups = pd.DataFrame(backups)
+
+    ss.initialized = True
+
+
+def tick_services() -> None:
+    rng = st.session_state.rng
+    for name, s in st.session_state.services.items():
+        r = rng.random()
+        if s["status"] == STATUS_OK and r < 0.025:
+            s["status"], s["since"] = STATUS_WARN, datetime.now()
+        elif s["status"] == STATUS_OK and r < 0.030:
+            s["status"], s["since"] = STATUS_DOWN, datetime.now()
+        elif s["status"] != STATUS_OK and r < 0.35:
+            s["status"], s["since"] = STATUS_OK, datetime.now()
+
+        base = {STATUS_OK: 45, STATUS_WARN: 380, STATUS_DOWN: 0}[s["status"]]
+        s["latency"] = 0.0 if s["status"] == STATUS_DOWN else max(
+            5.0, base + float(rng.normal(0, base * 0.2 + 5))
+        )
+        if s["status"] == STATUS_DOWN:
+            s["uptime"] = max(90.0, s["uptime"] - 0.05)
+        elif s["status"] == STATUS_WARN:
+            s["uptime"] = max(90.0, s["uptime"] - 0.005)
+        else:
+            s["uptime"] = min(99.999, s["uptime"] + 0.0005)
+
+
+def tick_auth_logs() -> None:
+    ss = st.session_state
+    rng = ss.rng
+    now = datetime.now()
+
+    # випадковий старт атаки (рідко) або за кнопкою
+    if ss.attack_ticks == 0 and rng.random() < 0.02:
+        ss.attack_ticks = int(rng.integers(3, 7))
+    if ss.attack_ticks > 0 and ss.attacker is None:
+        ss.attacker = EXTERNAL[rng.integers(len(EXTERNAL))]
+
+    new_events = [_make_event(rng, now) for _ in range(int(rng.integers(2, 8)))]
+
+    if ss.attack_ticks > 0:
+        new_events += [
+            _make_event(rng, now, attacker=ss.attacker)
+            for _ in range(int(rng.integers(15, 35)))
+        ]
+        ss.attack_ticks -= 1
+        if ss.attack_ticks == 0:
+            ss.attacker = None
+
+    ss.logs = pd.concat([ss.logs, pd.DataFrame(new_events)], ignore_index=True).tail(MAX_LOG_ROWS)
+
+
+def tick_servers() -> None:
+    ss = st.session_state
+    rng = ss.rng
+    now = datetime.now()
+    for name, m in ss.servers.items():
+        m["cpu"] = float(np.clip(m["cpu"] + rng.normal(0, 6) + (rng.random() < 0.03) * 30, 3, 100))
+        m["cpu"] = m["cpu"] * 0.93 + 35 * 0.07  # повернення до середнього
+        m["ram"] = float(np.clip(m["ram"] + rng.normal(0, 1.5), 15, 99))
+        m["disk"] = float(np.clip(m["disk"] + abs(rng.normal(0.02, 0.05)), 10, 99))
+        m["net"] = float(np.clip(m["net"] + rng.normal(0, 40), 5, 1000))
+
+    ss.cpu_hist.loc[now] = [ss.servers[s]["cpu"] for s in SERVERS]
+    ss.ram_hist.loc[now] = [ss.servers[s]["ram"] for s in SERVERS]
+    ss.cpu_hist = ss.cpu_hist.tail(MAX_HISTORY)
+    ss.ram_hist = ss.ram_hist.tail(MAX_HISTORY)
+
+
+def get_backups() -> pd.DataFrame:
+    """Стан резервного копіювання (з рідкісними збоями для демонстрації)."""
+    ss = st.session_state
+    rng = ss.rng
+    now = datetime.now()
+    df = ss.backups
+    for i in df.index:
+        # завдання іноді перезапускаються
+        if rng.random() < 0.01:
+            failed = rng.random() < 0.25
+            df.at[i, "Останній запуск"] = now
+            df.at[i, "Статус"] = "Помилка" if failed else "Успішно"
+            df.at[i, "Розмір, ГБ"] = round(float(rng.uniform(20, 900)), 1)
+            df.at[i, "Тривалість, хв"] = int(rng.integers(8, 95))
+        elif df.at[i, "Статус"] == "Помилка" and rng.random() < 0.05:
+            df.at[i, "Статус"] = "Успішно"
+            df.at[i, "Останній запуск"] = now
+
+    out = df.copy()
+    out["Вік, год"] = ((now - out["Останній запуск"]).dt.total_seconds() / 3600).round(1)
+
+    def _state(row) -> str:
+        if row["Статус"] == "Помилка":
+            return "🔴 Помилка"
+        if row["Вік, год"] > row["Макс. вік, год"]:
+            return "🟡 Прострочено"
+        return "🟢 Актуально"
+
+    out["Стан"] = out.apply(_state, axis=1)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Аналітика безпеки
+# ----------------------------------------------------------------------------
+def analyze_security(df: pd.DataFrame, window_min: int, threshold: int):
+    """Повертає (вікно логів, brute-force IP, список сповіщень)."""
+    cutoff = datetime.now() - timedelta(minutes=window_min)
+    w = df[df["time"] >= cutoff].copy()
+
+    failed = w[w["result"] == "Невдало"]
+    per_ip = (
+        failed.groupby(["ip", "city", "country"])
+        .agg(спроб=("user", "size"), логінів=("user", "nunique"), остання=("time", "max"))
+        .reset_index()
+    )
+    brute = per_ip[per_ip["спроб"] >= threshold].sort_values("спроб", ascending=False)
+
+    alerts = []
+    brute_ips = set(brute["ip"])
+
+    for _, r in brute.iterrows():
+        alerts.append(
+            {
+                "Час": r["остання"],
+                "Рівень": "🔴 Критично" if r["спроб"] >= threshold * 3 else "🟠 Високий",
+                "Тип": "Brute-force атака",
+                "Опис": f"{r['спроб']} невдалих спроб з {r['ip']} ({r['city']}, {r['country']}), "
+                f"перебрано {r['логінів']} логінів",
+            }
         )
 
-    st.divider()
-    sub_names = [s["name"] for s in substations]
-    selected_name = st.selectbox("Обрати підстанцію для деталей", sub_names)
-    selected = next(s for s in substations if s["name"] == selected_name)
+    # успішний вхід з IP, що підбирав паролі — можливий злам
+    comp = w[(w["result"] == "Успішно") & (w["ip"].isin(brute_ips))]
+    for _, r in comp.iterrows():
+        alerts.append(
+            {
+                "Час": r["time"],
+                "Рівень": "🔴 Критично",
+                "Тип": "Можливий злам облікового запису",
+                "Опис": f"Успішний вхід «{r['user']}» з {r['ip']} ({r['city']}) після серії невдалих спроб",
+            }
+        )
 
-    conn = get_conn()
-    docs = conn.execute(
-        "SELECT * FROM kb_documents WHERE substation_id=? AND min_access_level<=?",
-        (selected["id"], user["access_level"])
-    ).fetchall()
-    events = conn.execute(
-        "SELECT * FROM operational_log WHERE substation_id=? ORDER BY id DESC LIMIT 5",
-        (selected["id"],)
-    ).fetchall()
-    conn.close()
+    # успішні входи співробітників із-за кордону
+    geo = w[(w["result"] == "Успішно") & (w["country"] != "Україна") & (~w["ip"].isin(brute_ips))]
+    for _, r in geo.iterrows():
+        alerts.append(
+            {
+                "Час": r["time"],
+                "Рівень": "🟡 Середній",
+                "Тип": "Незвична геолокація",
+                "Опис": f"«{r['user']}» увійшов з {r['city']}, {r['country']} ({r['ip']}) → {r['system']}",
+            }
+        )
+
+    alerts_df = pd.DataFrame(alerts, columns=["Час", "Рівень", "Тип", "Опис"])
+    if not alerts_df.empty:
+        order = {"🔴 Критично": 0, "🟠 Високий": 1, "🟡 Середній": 2}
+        alerts_df["_o"] = alerts_df["Рівень"].map(order)
+        alerts_df = alerts_df.sort_values(["_o", "Час"], ascending=[True, False]).drop(columns="_o")
+    return w, brute, alerts_df
+
+
+# ----------------------------------------------------------------------------
+# UI-компоненти
+# ----------------------------------------------------------------------------
+CSS = """
+<style>
+.svc-card {border-radius: 14px; padding: 16px 18px; border: 1px solid rgba(128,128,128,.25);
+           background: rgba(128,128,128,.07); height: 100%;}
+.svc-title {font-size: 0.95rem; opacity: .8; margin-bottom: 6px;}
+.svc-status {font-size: 1.35rem; font-weight: 700;}
+.svc-meta {font-size: .8rem; opacity: .7; margin-top: 6px;}
+.dot {display:inline-block; width:12px; height:12px; border-radius:50%; margin-right:8px;
+      box-shadow: 0 0 8px currentColor;}
+.overall {border-radius: 14px; padding: 14px 20px; font-size: 1.15rem; font-weight: 700;
+          color: white; margin-bottom: 14px;}
+</style>
+"""
+
+
+def render_overall_and_services() -> None:
+    services = st.session_state.services
+    statuses = [s["status"] for s in services.values()]
+    down = statuses.count(STATUS_DOWN)
+    warn = statuses.count(STATUS_WARN)
+
+    if down:
+        color, text = "#ef4444", f"🔴 КРИТИЧНО: недоступних сервісів — {down}"
+    elif warn:
+        color, text = "#f59e0b", f"🟡 УВАГА: сервісів із деградацією — {warn}"
+    else:
+        color, text = "#16a34a", "🟢 Усі критичні сервіси працюють штатно"
+
+    st.markdown(
+        f'<div class="overall" style="background:{color}">{text}'
+        f'<span style="float:right;font-weight:400;font-size:.9rem">'
+        f'оновлено {datetime.now():%H:%M:%S}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(len(SERVICES))
+    for col, (name, s) in zip(cols, services.items()):
+        c = STATUS_COLOR[s["status"]]
+        lat = "—" if s["status"] == STATUS_DOWN else f"{s['latency']:.0f} мс"
+        col.markdown(
+            f"""
+            <div class="svc-card">
+              <div class="svc-title">{name}</div>
+              <div class="svc-status" style="color:{c}">
+                <span class="dot" style="background:{c};color:{c}"></span>{s['status']}
+              </div>
+              <div class="svc-meta">Відгук: {lat}<br>
+              Uptime: {s['uptime']:.3f}%<br>
+              У цьому стані з {s['since']:%H:%M:%S}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_security(window_min: int, threshold: int) -> None:
+    logs = st.session_state.logs
+    w, brute, alerts = analyze_security(logs, window_min, threshold)
+
+    total = len(w)
+    ok = int((w["result"] == "Успішно").sum())
+    bad = total - ok
+    foreign = int(((w["result"] == "Успішно") & (w["country"] != "Україна")).sum())
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Спроб авторизації", total)
+    k2.metric("Успішних", ok)
+    k3.metric("Невдалих", bad, delta=f"{bad / total * 100:.0f}%" if total else None, delta_color="inverse")
+    k4.metric("IP під підозрою (brute-force)", len(brute))
+    k5.metric("Входів із-за кордону", foreign)
+
+    if not brute.empty:
+        st.error(
+            f"⚠️ Виявлено brute-force активність: {len(brute)} IP-адрес(и) "
+            f"перевищили поріг {threshold} невдалих спроб за {window_min} хв."
+        )
+
+    left, right = st.columns([3, 2])
+
+    # --- Карта
+    with left:
+        st.subheader("🗺️ Географія входів")
+        if w.empty:
+            st.info("Немає подій у вибраному вікні.")
+        else:
+            geo = (
+                w.groupby(["city", "country", "lat", "lon", "result"])
+                .size()
+                .reset_index(name="n")
+            )
+            brute_cities = set(brute["city"]) if not brute.empty else set()
+
+            fig = go.Figure()
+            for res, color in [("Успішно", "#22c55e"), ("Невдало", "#ef4444")]:
+                g = geo[geo["result"] == res]
+                fig.add_trace(
+                    go.Scattergeo(
+                        lat=g["lat"],
+                        lon=g["lon"],
+                        text=g["city"] + ", " + g["country"] + " — " + g["n"].astype(str),
+                        hoverinfo="text",
+                        name=res,
+                        marker=dict(
+                            size=np.clip(g["n"] * 1.5 + 7, 8, 55),
+                            color=color,
+                            opacity=0.65,
+                            line=dict(
+                                width=[3 if c in brute_cities else 0.5 for c in g["city"]],
+                                color=["#000000" if c in brute_cities else "white" for c in g["city"]],
+                            ),
+                        ),
+                    )
+                )
+            fig.update_geos(
+                projection_type="natural earth",
+                showcountries=True,
+                showland=True,
+                landcolor="rgba(128,128,128,0.15)",
+                countrycolor="rgba(128,128,128,0.4)",
+                showocean=False,
+                bgcolor="rgba(0,0,0,0)",
+            )
+            fig.update_layout(
+                height=430,
+                margin=dict(l=0, r=0, t=0, b=0),
+                paper_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", y=-0.05),
+            )
+            st.plotly_chart(fig, use_container_width=True, key="geo_map")
+
+    # --- Динаміка
+    with right:
+        st.subheader("📈 Динаміка спроб")
+        if not w.empty:
+            t = w.copy()
+            span = max(window_min, 1)
+            freq = "1min" if span <= 60 else "5min"
+            t["bin"] = t["time"].dt.floor(freq)
+            ts = t.groupby(["bin", "result"]).size().reset_index(name="n")
+            fig2 = px.bar(
+                ts,
+                x="bin",
+                y="n",
+                color="result",
+                color_discrete_map={"Успішно": "#22c55e", "Невдало": "#ef4444"},
+                labels={"bin": "", "n": "Кількість", "result": ""},
+            )
+            fig2.update_layout(
+                height=430,
+                margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(orientation="h", y=1.08),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig2, use_container_width=True, key="auth_timeline")
+
+    # --- Сповіщення
+    st.subheader("🚨 Сповіщення про підозрілу активність")
+    if alerts.empty:
+        st.success("Підозрілої активності не виявлено.")
+    else:
+        st.dataframe(
+            alerts,
+            hide_index=True,
+            use_container_width=True,
+            column_config={"Час": st.column_config.DatetimeColumn(format="HH:mm:ss")},
+            height=min(400, 60 + 35 * len(alerts)),
+        )
 
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown(f"**📄 Документи бази знань для «{selected_name}»**")
-        if docs:
-            for d in docs:
-                with st.expander(f"{d['title']} ({d['category']})"):
-                    st.write(d["content"])
-        else:
-            st.caption("До цього об'єкта ще не прив'язано документів (або немає доступу за рівнем допуску).")
-
-    with c2:
-        st.markdown(f"**📒 Останні оперативні події**")
-        if events:
-            for e in events:
-                st.write(f"• {e['event_type']} — {e['status']} ({e['created_at']})")
-        else:
-            st.caption("Подій по цьому об'єкту ще не зафіксовано.")
-
-
-# ---------------------------------------------------------------------------
-# HR-панель (для ролі hr / admin)
-# ---------------------------------------------------------------------------
-def page_hr_panel(actor):
-    st.subheader("🗂️ HR-панель: заявки співробітників")
-    conn = get_conn()
-
-    st.markdown("**Заяви на відпустку / відгул**")
-    leaves = conn.execute(
-        "SELECT lr.id, u.full_name, lr.req_type, lr.date_from, lr.date_to, lr.status "
-        "FROM leave_requests lr JOIN users u ON u.id=lr.user_id ORDER BY lr.id DESC"
-    ).fetchall()
-    for lv in leaves:
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-        c1.write(f"**{lv['full_name']}** — {lv['req_type']}")
-        c2.write(f"{lv['date_from']} → {lv['date_to']}")
-        c3.write(lv["status"])
-        if lv["status"] == "На розгляді":
-            if c4.button("Погодити", key=f"ok_{lv['id']}"):
-                conn.execute("UPDATE leave_requests SET status='Погоджено' WHERE id=?", (lv["id"],))
-                conn.commit()
-                audit.log_action(actor, "CHANGE_STATUS", "leave_request", lv["id"],
-                                  f"«{lv['full_name']}» — {lv['req_type']}: На розгляді → Погоджено")
-                st.rerun()
-            if c4.button("Відхилити", key=f"no_{lv['id']}"):
-                conn.execute("UPDATE leave_requests SET status='Відхилено' WHERE id=?", (lv["id"],))
-                conn.commit()
-                audit.log_action(actor, "CHANGE_STATUS", "leave_request", lv["id"],
-                                  f"«{lv['full_name']}» — {lv['req_type']}: На розгляді → Відхилено")
-                st.rerun()
-
-    st.divider()
-    st.markdown("**Заявки на довідки**")
-    certs = conn.execute(
-        "SELECT cr.id, u.full_name, cr.cert_type, cr.status FROM certificate_requests cr "
-        "JOIN users u ON u.id=cr.user_id ORDER BY cr.id DESC"
-    ).fetchall()
-    for cr in certs:
-        c1, c2, c3 = st.columns([3, 2, 2])
-        c1.write(f"**{cr['full_name']}** — {cr['cert_type']}")
-        c2.write(cr["status"])
-        if cr["status"] != "Видано":
-            if c3.button("Позначити виданою", key=f"cert_{cr['id']}"):
-                conn.execute("UPDATE certificate_requests SET status='Видано' WHERE id=?", (cr["id"],))
-                conn.commit()
-                audit.log_action(actor, "CHANGE_STATUS", "certificate_request", cr["id"],
-                                  f"«{cr['full_name']}» — {cr['cert_type']}: → Видано")
-                st.rerun()
-
-    st.divider()
-    st.markdown("**Заявки на обладнання / ЗІЗ**")
-    eqs = conn.execute(
-        "SELECT er.*, u.full_name FROM equipment_requests er JOIN users u ON u.id=er.user_id "
-        "ORDER BY (er.priority='Термінова') DESC, er.id DESC"
-    ).fetchall()
-    for eq in eqs:
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-        pr = "🚨 " if eq["priority"] == "Термінова" else ""
-        c1.write(f"{pr}**{eq['full_name']}** — {eq['item_name']} ({eq['request_type']}, {eq['quantity']} шт)")
-        c2.write(eq["status"])
-        c3.write(eq["priority"])
-        if eq["status"] not in ("Видано/Виконано", "Відхилено"):
-            if c4.button("Видано/Виконано", key=f"eq_ok_{eq['id']}"):
-                conn.execute("UPDATE equipment_requests SET status='Видано/Виконано', resolved_at=? WHERE id=?",
-                             (now(), eq["id"]))
-                conn.commit()
-                audit.log_action(actor, "CHANGE_STATUS", "equipment_request", eq["id"],
-                                  f"«{eq['full_name']}» — {eq['item_name']}: → Видано/Виконано")
-                st.rerun()
-            if c4.button("Відхилити", key=f"eq_no_{eq['id']}"):
-                conn.execute("UPDATE equipment_requests SET status='Відхилено', resolved_at=? WHERE id=?",
-                             (now(), eq["id"]))
-                conn.commit()
-                audit.log_action(actor, "CHANGE_STATUS", "equipment_request", eq["id"],
-                                  f"«{eq['full_name']}» — {eq['item_name']}: → Відхилено")
-                st.rerun()
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Панель ОП: зведення по тестуванню всього персоналу (для safety_admin / admin)
-# ---------------------------------------------------------------------------
-def page_safety_admin(actor):
-    tabs = st.tabs(["📋 Зведення тестування", "📢 Сповіщення", "🤖 Автогенерація тестів (AI)"])
-
-    with tabs[0]:
-        st.subheader("📋 Зведення проходження інструктажів (для аудиту Держпраці)")
-        conn = get_conn()
-        rows = conn.execute(
-            "SELECT u.full_name, u.position, u.branch, si.title, tr.score, tr.passed, tr.taken_at "
-            "FROM test_results tr JOIN users u ON u.id=tr.user_id "
-            "JOIN safety_instructions si ON si.id=tr.instruction_id ORDER BY tr.taken_at DESC"
-        ).fetchall()
-        conn.close()
-        if rows:
-            st.dataframe(
-                [{"Співробітник": r["full_name"], "Посада": r["position"], "Філія": r["branch"],
-                  "Інструктаж": r["title"], "Результат, %": r["score"],
-                  "Зараховано": "✅" if r["passed"] else "❌", "Дата": r["taken_at"]} for r in rows],
-                use_container_width=True, hide_index=True,
-            )
-        else:
-            st.info("Жоден співробітник ще не проходив тестування.")
-
-    with tabs[1]:
-        st.markdown("**Додати нове сповіщення / попередження**")
-        with st.form("new_notif"):
-            title = st.text_input("Заголовок")
-            body = st.text_area("Текст")
-            branch = st.text_input("Філія (порожньо = усі)")
-            urgent = st.checkbox("Термінове (аварійне)")
-            if st.form_submit_button("Опублікувати"):
-                conn = get_conn()
-                cur = conn.execute(
-                    "INSERT INTO notifications (title, body, department, branch, urgent, created_at) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (title, body, None, branch or None, int(urgent), now())
-                )
-                conn.commit()
-                conn.close()
-                audit.log_action(actor, "CREATE", "notification", cur.lastrowid,
-                                  f"Опубліковано сповіщення «{title}» ({'термінове' if urgent else 'звичайне'})")
-                st.success("Сповіщення опубліковано.")
-                st.rerun()
-
-    with tabs[2]:
-        page_quiz_autogen(actor)
-
-
-# ---------------------------------------------------------------------------
-# Модуль 5: Управління системою (розширена роль Адміністратора)
-# ---------------------------------------------------------------------------
-# Адміністратор бачить і може керувати всім, що недоступно з UI іншим ролям:
-# користувачами, розкладами будь-кого, базою знань, підстанціями та планами
-# адаптації — тобто закриває прогалини, яких не вистачало окремим ролям.
-
-ONBOARDING_TASK_TYPES = ["Інструктаж", "Регламент", "Ментор", "Інше"]
-
-
-def page_admin_overview():
-    st.subheader("📊 Загальний огляд системи")
-    conn = get_conn()
-
-    n_users = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    n_open_leave = conn.execute("SELECT COUNT(*) c FROM leave_requests WHERE status='На розгляді'").fetchone()["c"]
-    n_open_cert = conn.execute("SELECT COUNT(*) c FROM certificate_requests WHERE status!='Видано'").fetchone()["c"]
-    n_open_equip = conn.execute(
-        "SELECT COUNT(*) c FROM equipment_requests WHERE status NOT IN ('Видано/Виконано','Відхилено')"
-    ).fetchone()["c"]
-    n_open_incidents = conn.execute("SELECT COUNT(*) c FROM operational_log WHERE status!='Закрито'").fetchone()["c"]
-    n_docs = conn.execute("SELECT COUNT(*) c FROM kb_documents").fetchone()["c"]
-    n_subs = conn.execute("SELECT COUNT(*) c FROM substations").fetchone()["c"]
-    n_onboarding = conn.execute(
-        "SELECT COUNT(DISTINCT user_id) c FROM onboarding_tasks WHERE user_id IN "
-        "(SELECT id FROM onboarding_tasks GROUP BY user_id HAVING SUM(CASE WHEN status!='Виконано' THEN 1 ELSE 0 END) > 0)"
-    ).fetchone()["c"]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Співробітників", n_users)
-    c2.metric("Відкриті заяви на відпустку", n_open_leave)
-    c3.metric("Довідки в обробці", n_open_cert)
-    c4.metric("Заявки на ЗІЗ в роботі", n_open_equip)
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Незакриті оперативні події", n_open_incidents, delta=None,
-              delta_color="inverse" if n_open_incidents else "normal")
-    c6.metric("Документів у базі знань", n_docs)
-    c7.metric("Підстанцій у системі", n_subs)
-    c8.metric("Новачків в адаптації", n_onboarding)
-
-    st.divider()
-    st.markdown("**🚨 Активні аварійні/незакриті оперативні події**")
-    incidents = conn.execute(
-        "SELECT ol.*, s.name AS sub_name FROM operational_log ol LEFT JOIN substations s ON s.id=ol.substation_id "
-        "WHERE ol.status!='Закрито' ORDER BY ol.id DESC"
-    ).fetchall()
-    if incidents:
-        st.dataframe(
-            [{"Подія": r["event_type"], "Об'єкт": r["sub_name"] or "—", "Статус": r["status"],
-              "Створено": r["created_at"]} for r in incidents],
-            use_container_width=True, hide_index=True,
+        st.subheader("Топ IP за невдалими спробами")
+        failed_ip = (
+            w[w["result"] == "Невдало"]
+            .groupby(["ip", "city", "country"])
+            .size()
+            .reset_index(name="Невдалих спроб")
+            .sort_values("Невдалих спроб", ascending=False)
+            .head(8)
+            .rename(columns={"ip": "IP", "city": "Місто", "country": "Країна"})
         )
+        if failed_ip.empty:
+            st.caption("Немає невдалих спроб.")
+        else:
+            st.dataframe(
+                failed_ip,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Невдалих спроб": st.column_config.ProgressColumn(
+                        min_value=0, max_value=int(failed_ip["Невдалих спроб"].max()), format="%d"
+                    )
+                },
+            )
+    with c2:
+        st.subheader("Останні події авторизації")
+        last = (
+            w.sort_values("time", ascending=False)
+            .head(50)[["time", "user", "system", "ip", "city", "country", "result"]]
+            .rename(
+                columns={
+                    "time": "Час",
+                    "user": "Логін",
+                    "system": "Система",
+                    "ip": "IP",
+                    "city": "Місто",
+                    "country": "Країна",
+                    "result": "Результат",
+                }
+            )
+        )
+        st.dataframe(
+            last,
+            hide_index=True,
+            use_container_width=True,
+            height=300,
+            column_config={"Час": st.column_config.DatetimeColumn(format="HH:mm:ss")},
+        )
+
+
+def _threshold_color(v: float, warn: float, crit: float) -> str:
+    return "#ef4444" if v >= crit else "#f59e0b" if v >= warn else "#22c55e"
+
+
+def render_infrastructure() -> None:
+    ss = st.session_state
+    rows = []
+    for name, m in ss.servers.items():
+        rows.append(
+            {
+                "Сервер": name,
+                "CPU, %": round(m["cpu"], 1),
+                "RAM, %": round(m["ram"], 1),
+                "Диск, %": round(m["disk"], 1),
+                "Мережа, Мбіт/с": round(m["net"]),
+            }
+        )
+    df = pd.DataFrame(rows)
+
+    # KPI
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Середнє навантаження CPU", f"{df['CPU, %'].mean():.0f}%")
+    k2.metric("Середнє використання RAM", f"{df['RAM, %'].mean():.0f}%")
+    k3.metric("Найзаповненіший диск", f"{df['Диск, %'].max():.0f}%",
+              help=df.loc[df["Диск, %"].idxmax(), "Сервер"])
+    hot = int(((df["CPU, %"] > 85) | (df["RAM, %"] > 90) | (df["Диск, %"] > 90)).sum())
+    k4.metric("Серверів у критичному стані", hot, delta_color="inverse",
+              delta="потрібна увага" if hot else "норма")
+
+    st.subheader("🖥️ Стан серверів")
+    st.dataframe(
+        df,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "CPU, %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+            "RAM, %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+            "Диск, %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+            "Мережа, Мбіт/с": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    # Графіки історії
+    c1, c2 = st.columns(2)
+    for col, hist, title, key in [
+        (c1, ss.cpu_hist, "Навантаження CPU, %", "cpu_chart"),
+        (c2, ss.ram_hist, "Використання RAM, %", "ram_chart"),
+    ]:
+        with col:
+            st.subheader(title)
+            long = hist.reset_index().melt(id_vars="index", var_name="Сервер", value_name="val")
+            fig = px.line(long, x="index", y="val", color="Сервер",
+                          labels={"index": "", "val": "%"})
+            fig.add_hline(y=85, line_dash="dot", line_color="#ef4444", opacity=0.6)
+            fig.update_yaxes(range=[0, 100])
+            fig.update_layout(
+                height=330,
+                margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(orientation="h", y=-0.2, title=""),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig, use_container_width=True, key=key)
+
+    # Бекапи
+    st.subheader("💾 Резервне копіювання")
+    b = get_backups()
+    bad = int(b["Стан"].str.contains("Помилка|Прострочено").sum())
+    if bad:
+        st.warning(f"Завдань бекапу, що потребують уваги: {bad}")
     else:
-        st.caption("Немає незакритих подій.")
-    conn.close()
-
-
-def page_admin_users(actor):
-    st.subheader("👥 Керування користувачами")
-    conn = get_conn()
-    users = conn.execute("SELECT * FROM users ORDER BY full_name").fetchall()
+        st.success("Усі завдання резервного копіювання виконані вчасно.")
 
     st.dataframe(
-        [{"ПІБ": u["full_name"], "Логін": u["login"], "Посада": u["position"], "Підрозділ": u["department"],
-          "Філія": u["branch"], "Роль": ROLE_LABELS.get(u["role"], u["role"]),
-          "Рівень допуску": u["access_level"], "Новачок": "✅" if u["is_new_hire"] else "",
-          "Дата прийому": u["hire_date"]} for u in users],
-        use_container_width=True, hide_index=True,
+        b[["Стан", "Завдання", "Сервер", "Останній запуск", "Вік, год", "Розмір, ГБ", "Тривалість, хв"]],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Останній запуск": st.column_config.DatetimeColumn(format="DD.MM HH:mm"),
+            "Розмір, ГБ": st.column_config.NumberColumn(format="%.1f"),
+        },
     )
 
-    st.divider()
-    with st.expander("➕ Додати нового співробітника"):
-        with st.form("add_user_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            login = c1.text_input("Логін")
-            password = c2.text_input("Тимчасовий пароль", value="1234")
-            full_name = st.text_input("ПІБ")
-            c3, c4 = st.columns(2)
-            position = c3.text_input("Посада")
-            department = c4.text_input("Підрозділ")
-            c5, c6 = st.columns(2)
-            branch = c5.text_input("Філія")
-            role = c6.selectbox("Роль", list(ROLE_LABELS.keys()), format_func=lambda r: ROLE_LABELS[r])
-            c7, c8 = st.columns(2)
-            access_level = c7.number_input("Рівень допуску", min_value=1, max_value=5, value=1)
-            hire_date = c8.date_input("Дата прийому на роботу", dt.date.today())
-            is_new_hire = st.checkbox("Позначити як новачка (активувати модуль адаптації)")
-            submitted = st.form_submit_button("Створити користувача", use_container_width=True)
-            if submitted:
-                if not login.strip() or not full_name.strip():
-                    st.warning("Заповніть щонайменше логін та ПІБ.")
-                elif conn.execute("SELECT 1 FROM users WHERE login=?", (login,)).fetchone():
-                    st.error("Користувач з таким логіном вже існує.")
-                else:
-                    conn.execute(
-                        "INSERT INTO users (login,password,full_name,position,department,branch,role,"
-                        "access_level,hire_date,is_new_hire) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (login, password, full_name, position, department, branch, role,
-                         int(access_level), hire_date.isoformat(), int(is_new_hire))
-                    )
-                    conn.commit()
-                    audit.log_action(actor, "CREATE", "user", None,
-                                      f"Створено користувача «{full_name}» (логін {login}, роль {role})")
-                    st.success(f"Користувача «{full_name}» створено.")
-                    st.rerun()
 
-    st.divider()
-    st.markdown("**✏️ Редагувати / деактивувати доступ співробітника**")
-    names = {u["full_name"]: u["id"] for u in users}
-    selected_name = st.selectbox("Оберіть співробітника", list(names.keys()), key="edit_user_select")
-    sel = conn.execute("SELECT * FROM users WHERE id=?", (names[selected_name],)).fetchone()
+# ----------------------------------------------------------------------------
+# Головна програма
+# ----------------------------------------------------------------------------
+def main() -> None:
+    init_state()
+    st.markdown(CSS, unsafe_allow_html=True)
 
-    with st.form("edit_user_form"):
-        c1, c2 = st.columns(2)
-        position = c1.text_input("Посада", value=sel["position"] or "")
-        department = c2.text_input("Підрозділ", value=sel["department"] or "")
-        c3, c4 = st.columns(2)
-        branch = c3.text_input("Філія", value=sel["branch"] or "")
-        role = c4.selectbox("Роль", list(ROLE_LABELS.keys()),
-                             index=list(ROLE_LABELS.keys()).index(sel["role"]),
-                             format_func=lambda r: ROLE_LABELS[r])
-        c5, c6 = st.columns(2)
-        access_level = c5.number_input("Рівень допуску", min_value=1, max_value=5, value=sel["access_level"])
-        is_new_hire = c6.checkbox("Новачок (модуль адаптації активний)", value=bool(sel["is_new_hire"]))
-        new_password = st.text_input("Новий пароль (залиште порожнім, щоб не змінювати)")
-        save = st.form_submit_button("Зберегти зміни", use_container_width=True)
-        if save:
-            conn.execute(
-                "UPDATE users SET position=?, department=?, branch=?, role=?, access_level=?, is_new_hire=? "
-                "WHERE id=?",
-                (position, department, branch, role, int(access_level), int(is_new_hire), sel["id"])
-            )
-            if new_password.strip():
-                conn.execute("UPDATE users SET password=? WHERE id=?", (new_password.strip(), sel["id"]))
-            conn.commit()
-            audit.log_action(actor, "UPDATE", "user", sel["id"],
-                              f"Оновлено профіль «{sel['full_name']}» (роль {role}, рівень допуску {access_level}"
-                              f"{', скинуто пароль' if new_password.strip() else ''})")
-            st.success("Зміни збережено.")
-            st.rerun()
-    conn.close()
-
-
-def page_admin_schedules(actor):
-    st.subheader("🗓️ Розклади змін — перегляд і редагування для будь-кого")
-    conn = get_conn()
-    users = conn.execute("SELECT * FROM users ORDER BY full_name").fetchall()
-    names = {u["full_name"]: u["id"] for u in users}
-    selected_name = st.selectbox("Оберіть співробітника", list(names.keys()), key="sched_user_select")
-    target_id = names[selected_name]
-
-    rows = conn.execute(
-        "SELECT * FROM schedules WHERE user_id=? ORDER BY work_date", (target_id,)
-    ).fetchall()
-
-    events = [{
-        "title": f"{r['shift']} · {r['location']}", "start": r["work_date"], "end": r["work_date"],
-        "allDay": True,
-    } for r in rows]
-    st_calendar(events=events, options={
-        "headerToolbar": {"left": "prev,next today", "center": "title", "right": "dayGridMonth,listMonth"},
-        "initialView": "dayGridMonth", "height": 550, "locale": "uk", "firstDay": 1,
-    }, key=f"admin_cal_{target_id}")
-
-    st.markdown("**➕ Додати зміну**")
-    with st.form("add_shift_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        work_date = c1.date_input("Дата", dt.date.today())
-        shift = c2.text_input("Зміна (напр. «08:00–20:00»)")
-        location = c3.text_input("Локація")
-        if st.form_submit_button("Додати зміну"):
-            if not shift.strip():
-                st.warning("Вкажіть час зміни.")
-            else:
-                conn.execute(
-                    "INSERT INTO schedules (user_id, work_date, shift, location) VALUES (?,?,?,?)",
-                    (target_id, work_date.isoformat(), shift, location)
-                )
-                conn.commit()
-                audit.log_action(actor, "CREATE", "schedule", None,
-                                  f"Додано зміну {work_date.isoformat()} ({shift}) для «{selected_name}»")
-                st.success("Зміну додано.")
-                st.rerun()
-    conn.close()
-
-
-def page_admin_kb(actor):
-    st.subheader("📚 Керування базою технічних знань")
-    conn = get_conn()
-    substations = conn.execute("SELECT id, name FROM substations ORDER BY name").fetchall()
-    sub_options = {"— не прив'язано —": None}
-    sub_options.update({s["name"]: s["id"] for s in substations})
-
-    docs = conn.execute("SELECT * FROM kb_documents ORDER BY title").fetchall()
-    st.markdown(f"**Усього документів: {len(docs)}**")
-    for d in docs:
-        with st.expander(f"{d['title']} ({d['category']})"):
-            with st.form(f"edit_doc_{d['id']}"):
-                title = st.text_input("Назва", value=d["title"])
-                c1, c2 = st.columns(2)
-                category = c1.text_input("Категорія", value=d["category"] or "")
-                tags = c2.text_input("Теги (через кому)", value=d["tags"] or "")
-                content = st.text_area("Зміст", value=d["content"], height=150)
-                c3, c4, c5 = st.columns(3)
-                min_access = c3.number_input("Мін. рівень допуску", min_value=1, max_value=5,
-                                              value=d["min_access_level"])
-                owner = c4.text_input("Власник", value=d["owner"] or "")
-                cur_sub_name = next((n for n, i in sub_options.items() if i == d["substation_id"]),
-                                     "— не прив'язано —")
-                sub_name = c5.selectbox("Підстанція", list(sub_options.keys()),
-                                         index=list(sub_options.keys()).index(cur_sub_name),
-                                         key=f"sub_sel_{d['id']}")
-                bc1, bc2 = st.columns(2)
-                save = bc1.form_submit_button("💾 Зберегти", use_container_width=True)
-                delete = bc2.form_submit_button("🗑️ Видалити документ", use_container_width=True)
-                if save:
-                    conn.execute(
-                        "UPDATE kb_documents SET title=?, category=?, tags=?, content=?, min_access_level=?, "
-                        "owner=?, substation_id=?, updated_at=? WHERE id=?",
-                        (title, category, tags, content, int(min_access), owner,
-                         sub_options[sub_name], now(), d["id"])
-                    )
-                    conn.commit()
-                    audit.log_action(actor, "UPDATE", "kb_document", d["id"],
-                                      f"Оновлено документ «{title}» (мін. рівень допуску {min_access})")
-                    st.success("Документ оновлено.")
-                    st.rerun()
-                if delete:
-                    conn.execute("DELETE FROM kb_documents WHERE id=?", (d["id"],))
-                    conn.commit()
-                    audit.log_action(actor, "DELETE", "kb_document", d["id"],
-                                      f"Видалено документ «{d['title']}»")
-                    st.success("Документ видалено.")
-                    st.rerun()
-
-    st.divider()
-    with st.expander("➕ Додати новий документ"):
-        with st.form("add_doc_form", clear_on_submit=True):
-            title = st.text_input("Назва документа")
-            c1, c2 = st.columns(2)
-            category = c1.text_input("Категорія (Регламент/Схема/Паспорт обладнання/Інструкція/НПАОП)")
-            tags = c2.text_input("Теги (через кому)")
-            content = st.text_area("Зміст документа", height=150)
-            c3, c4, c5 = st.columns(3)
-            min_access = c3.number_input("Мін. рівень допуску", min_value=1, max_value=5, value=1)
-            owner = c4.text_input("Власник (підрозділ)")
-            sub_name = c5.selectbox("Прив'язати до підстанції", list(sub_options.keys()), key="new_doc_sub")
-            if st.form_submit_button("Додати документ", use_container_width=True):
-                if not title.strip() or not content.strip():
-                    st.warning("Вкажіть назву та зміст документа.")
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO kb_documents (title, category, tags, content, min_access_level, owner, "
-                        "updated_at, substation_id) VALUES (?,?,?,?,?,?,?,?)",
-                        (title, category, tags, content, int(min_access), owner, now(), sub_options[sub_name])
-                    )
-                    conn.commit()
-                    audit.log_action(actor, "CREATE", "kb_document", cur.lastrowid,
-                                      f"Створено документ «{title}» (мін. рівень допуску {min_access})")
-                    st.success("Документ додано до бази знань.")
-                    st.rerun()
-    conn.close()
-
-
-def page_admin_substations(actor):
-    st.subheader("⚡ Керування підстанціями")
-    conn = get_conn()
-    substations = conn.execute("SELECT * FROM substations ORDER BY name").fetchall()
-
-    for s in substations:
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-            c1.markdown(f"**{s['name']}**")
-            c2.caption(f"{s['branch']} · {s['voltage_class']}")
-            new_status = c3.selectbox(
-                "Статус", list(STATUS_COLOR.keys()),
-                index=list(STATUS_COLOR.keys()).index(s["status"]) if s["status"] in STATUS_COLOR else 0,
-                key=f"sub_status_{s['id']}", label_visibility="collapsed"
-            )
-            if c4.button("Оновити статус", key=f"sub_upd_{s['id']}"):
-                conn.execute("UPDATE substations SET status=? WHERE id=?", (new_status, s["id"]))
-                conn.commit()
-                audit.log_action(actor, "CHANGE_STATUS", "substation", s["id"],
-                                  f"«{s['name']}»: {s['status']} → {new_status}")
-                st.success(f"Статус «{s['name']}» оновлено.")
-                st.rerun()
-
-    st.divider()
-    with st.expander("➕ Додати нову підстанцію"):
-        with st.form("add_sub_form", clear_on_submit=True):
-            name = st.text_input("Назва підстанції")
-            c1, c2 = st.columns(2)
-            branch = c1.text_input("Філія")
-            voltage_class = c2.text_input("Клас напруги (напр. «110/10 кВ»)")
-            c3, c4 = st.columns(2)
-            lat = c3.number_input("Широта", value=48.4647, format="%.4f")
-            lon = c4.number_input("Довгота", value=35.0462, format="%.4f")
-            status = st.selectbox("Початковий статус", list(STATUS_COLOR.keys()))
-            if st.form_submit_button("Додати підстанцію", use_container_width=True):
-                if not name.strip():
-                    st.warning("Вкажіть назву підстанції.")
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO substations (name, branch, voltage_class, latitude, longitude, status) "
-                        "VALUES (?,?,?,?,?,?)",
-                        (name, branch, voltage_class, lat, lon, status)
-                    )
-                    conn.commit()
-                    audit.log_action(actor, "CREATE", "substation", cur.lastrowid,
-                                      f"Додано підстанцію «{name}» ({branch}, {voltage_class})")
-                    st.success("Підстанцію додано.")
-                    st.rerun()
-    conn.close()
-
-
-def page_admin_onboarding(actor):
-    st.subheader("🧭 Плани адаптації новачків")
-    conn = get_conn()
-
-    progress_rows = conn.execute(
-        "SELECT u.id, u.full_name, u.position, u.branch, "
-        "COUNT(t.id) AS total, SUM(CASE WHEN t.status='Виконано' THEN 1 ELSE 0 END) AS done "
-        "FROM onboarding_tasks t JOIN users u ON u.id=t.user_id GROUP BY u.id ORDER BY u.full_name"
-    ).fetchall()
-
-    if progress_rows:
-        st.markdown("**Прогрес по всіх активних планах адаптації**")
-        for r in progress_rows:
-            pct = (r["done"] / r["total"]) if r["total"] else 0
-            st.write(f"**{r['full_name']}** — {r['position']} ({r['branch']})")
-            st.progress(pct, text=f"{r['done']} / {r['total']} кроків виконано")
-    else:
-        st.caption("Наразі жодного плану адаптації не створено.")
-
-    st.divider()
-    st.markdown("**➕ Створити / доповнити план адаптації**")
-
-    users = conn.execute("SELECT * FROM users ORDER BY full_name").fetchall()
-    names = {u["full_name"]: u["id"] for u in users}
-    selected_name = st.selectbox("Співробітник", list(names.keys()), key="onb_user_select")
-    target = conn.execute("SELECT * FROM users WHERE id=?", (names[selected_name],)).fetchone()
-
-    existing = conn.execute(
-        "SELECT * FROM onboarding_tasks WHERE user_id=? ORDER BY order_index", (target["id"],)
-    ).fetchall()
-    if existing:
-        st.markdown("Поточні кроки:")
-        for t in existing:
-            mark = "✅" if t["status"] == "Виконано" else "⬜"
-            st.write(f"{mark} Крок {t['order_index']}: {t['title']} ({t['task_type']})")
-
-    instructions = conn.execute("SELECT id, title FROM safety_instructions ORDER BY title").fetchall()
-    documents = conn.execute("SELECT id, title FROM kb_documents ORDER BY title").fetchall()
-
-    with st.form("add_onboarding_step", clear_on_submit=True):
-        task_type = st.selectbox("Тип кроку", ONBOARDING_TASK_TYPES)
-        title = st.text_input("Назва кроку")
-        description = st.text_area("Опис")
-        instr_choice = None
-        doc_choice = None
-        mentor_name = ""
-        if task_type == "Інструктаж" and instructions:
-            instr_map = {i["title"]: i["id"] for i in instructions}
-            instr_choice = st.selectbox("Пов'язаний інструктаж", list(instr_map.keys()))
-        elif task_type == "Регламент" and documents:
-            doc_map = {d["title"]: d["id"] for d in documents}
-            doc_choice = st.selectbox("Пов'язаний документ", list(doc_map.keys()))
-        elif task_type == "Ментор":
-            mentor_name = st.text_input("ПІБ ментора")
-
-        submitted = st.form_submit_button("Додати крок до плану", use_container_width=True)
-        if submitted:
-            if not title.strip():
-                st.warning("Вкажіть назву кроку.")
-            else:
-                next_order = (max((t["order_index"] for t in existing), default=0)) + 1
-                related_instr = instr_map[instr_choice] if task_type == "Інструктаж" and instructions else None
-                related_doc = doc_map[doc_choice] if task_type == "Регламент" and documents else None
-                conn.execute(
-                    "INSERT INTO onboarding_tasks (user_id, order_index, task_type, title, description, "
-                    "related_instruction_id, related_document_id, mentor_name, status) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (target["id"], next_order, task_type, title, description,
-                     related_instr, related_doc, mentor_name or None, "Не виконано")
-                )
-                conn.execute("UPDATE users SET is_new_hire=1 WHERE id=?", (target["id"],))
-                conn.commit()
-                audit.log_action(actor, "CREATE", "onboarding_task", None,
-                                  f"Додано крок адаптації «{title}» ({task_type}) для «{selected_name}»")
-                st.success(f"Крок додано до плану адаптації «{selected_name}».")
-                st.rerun()
-    conn.close()
-
-
-def page_quiz_autogen(actor):
-    st.subheader("🤖 Автогенерація тестів з ОП (AI)")
-
-    llm_on = llm_client.is_llm_configured()
-    if llm_on:
-        st.caption(f"LLM підключено (модель: {llm_client.OPENAI_CHAT_MODEL}) — питання генеруються LLM.")
-    else:
-        st.warning(
-            "LLM не налаштована — буде використано евристичний генератор («заповни пропуск» на основі "
-            "найінформативніших речень документа). Це чернетка нижчої якості, ніж LLM, але дозволяє "
-            "одразу отримати робочий тест. Див. `.env.example`, щоб підключити OpenAI API або Ollama.",
-            icon="⚪",
-        )
-
-    st.markdown("**1. Завантажте документ з правилами безпеки**")
-    uploaded = st.file_uploader("PDF-документ", type=["pdf"])
-    manual_text = st.text_area(
-        "…або вставте текст документа вручну (якщо немає PDF)", height=120,
-        placeholder="Можна вставити текст регламенту/інструкції напряму, якщо PDF немає під рукою."
-    )
-
-    extracted_text = None
-    if uploaded is not None:
-        try:
-            extracted_text = pdf_reader.extract_text(uploaded)
-            if not extracted_text.strip():
-                st.error("Не вдалося витягнути текст із цього PDF (можливо, це скан-зображення без текстового шару).")
-                extracted_text = None
-            else:
-                with st.expander("Переглянути витягнутий текст"):
-                    st.text(extracted_text[:5000] + ("…" if len(extracted_text) > 5000 else ""))
-        except Exception as e:
-            st.error(f"Помилка читання PDF: {e}")
-    elif manual_text.strip():
-        extracted_text = manual_text
-
-    st.markdown("**2. Налаштування генерації**")
-    c1, c2 = st.columns(2)
-    n_questions = c1.number_input("Кількість питань", min_value=2, max_value=15, value=5)
-    instr_title = c2.text_input("Назва нового інструктажу", value=uploaded.name.rsplit(".", 1)[0] if uploaded else "")
-
-    gen_key = f"generated_quiz_{actor['id']}"
-    if st.button("✨ Згенерувати тест", use_container_width=True, disabled=not extracted_text):
-        with st.spinner("Аналізую документ і генерую тестові питання..."):
-            questions, used_llm = quiz_generator.generate_questions(extracted_text, int(n_questions))
-        st.session_state[gen_key] = {"questions": questions, "used_llm": used_llm, "text": extracted_text}
-        audit.log_action(
-            actor, "GENERATE_QUIZ", object_type="safety_instruction", object_id=None,
-            description=f"Згенеровано {len(questions)} питань для «{instr_title or 'без назви'}» (LLM: {used_llm})"
-        )
-
-    if gen_key in st.session_state:
-        gen = st.session_state[gen_key]
-        st.markdown("**3. Перегляньте та відредагуйте згенеровані питання перед збереженням**")
-        if not gen["used_llm"]:
-            st.caption("⚪ Питання згенеровано евристичним fallback-методом (без LLM).")
-        else:
-            st.caption("🟢 Питання згенеровано LLM.")
-
-        edited_questions = []
-        for i, q in enumerate(gen["questions"]):
-            with st.container(border=True):
-                q_text = st.text_input(f"Питання {i+1}", value=q["question"], key=f"qtext_{gen_key}_{i}")
-                options = []
-                for j, opt in enumerate(q["options"]):
-                    options.append(st.text_input(f"Варіант {j+1}", value=opt, key=f"qopt_{gen_key}_{i}_{j}"))
-                correct = st.radio(
-                    "Правильна відповідь", options, index=min(q["correct_index"], len(options) - 1),
-                    key=f"qcorrect_{gen_key}_{i}"
-                )
-                edited_questions.append({"question": q_text, "options": options, "correct_index": options.index(correct)})
-
-        conn_positions = get_conn()
-        positions = sorted({u["position"] for u in conn_positions.execute("SELECT DISTINCT position FROM users").fetchall()})
-        conn_positions.close()
-        role_for = st.selectbox(
-            "Обов'язково для ролі/посади", ["Усі"] + positions,
-            key=f"role_for_{gen_key}"
-        )
-
-        if st.button("💾 Зберегти інструктаж і тест у базу", use_container_width=True):
-            final_title = instr_title.strip() or "Новий інструктаж"
-            conn = get_conn()
-            cur = conn.execute(
-                "INSERT INTO safety_instructions (title, category, content, required_for_role, valid_days) "
-                "VALUES (?,?,?,?,?)",
-                (final_title, "Завантажено з PDF (AI)", gen["text"][:4000], role_for, 90)
-            )
-            instr_id = cur.lastrowid
-            for q in edited_questions:
-                conn.execute(
-                    "INSERT INTO quiz_questions (instruction_id, question, options, correct_index) VALUES (?,?,?,?)",
-                    (instr_id, q["question"], json.dumps(q["options"], ensure_ascii=False), q["correct_index"])
-                )
-            conn.commit()
-            conn.close()
-            audit.log_action(
-                actor, "CREATE", "safety_instruction", instr_id,
-                f"Створено інструктаж «{final_title}» з {len(edited_questions)} AI-згенерованими питаннями"
-            )
-            del st.session_state[gen_key]
-            st.success(f"Інструктаж «{final_title}» та {len(edited_questions)} питань збережено в базі.")
-            st.rerun()
-
-
-def page_audit_log():
-    st.subheader("🕵️ Журнал аудиту дій")
-    st.caption(
-        "Хто й коли переглядав документи, складав тести, змінював статуси заявок тощо. "
-        "Записи незмінні (append-only) — критично для аудиту на держпідприємствах та в енергетиці."
-    )
-
-    conn = get_conn()
-    users = conn.execute("SELECT id, full_name FROM users ORDER BY full_name").fetchall()
-    action_types = [r["action_type"] for r in conn.execute(
-        "SELECT DISTINCT action_type FROM audit_log ORDER BY action_type"
-    ).fetchall()]
-    conn.close()
-
-    c1, c2 = st.columns(2)
-    user_filter = c1.selectbox("Користувач", ["Усі"] + [u["full_name"] for u in users])
-    action_filter = c2.selectbox("Тип дії", ["Усі"] + action_types)
-
-    user_id = None
-    if user_filter != "Усі":
-        user_id = next(u["id"] for u in users if u["full_name"] == user_filter)
-
-    rows = audit.get_log(limit=500, user_id=user_id, action_type=action_filter)
-
-    st.caption(f"Показано останніх {len(rows)} записів.")
-    if rows:
-        st.dataframe(
-            [{"Дата/час": r["created_at"], "Користувач": r["user_name"], "Дія": r["action_type"],
-              "Об'єкт": r["object_type"] or "—", "ID об'єкта": r["object_id"] or "—",
-              "Опис": r["description"] or ""} for r in rows],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info("Записів, що відповідають фільтру, ще немає.")
-
-
-def page_system_admin(actor):
-    tabs = st.tabs(["Огляд", "Користувачі", "Розклади", "База знань", "Підстанції",
-                     "Адаптація новачків", "🤖 Автогенерація тестів (AI)", "🕵️ Аудит"])
-    with tabs[0]:
-        page_admin_overview()
-    with tabs[1]:
-        page_admin_users(actor)
-    with tabs[2]:
-        page_admin_schedules(actor)
-    with tabs[3]:
-        page_admin_kb(actor)
-    with tabs[4]:
-        page_admin_substations(actor)
-    with tabs[5]:
-        page_admin_onboarding(actor)
-    with tabs[6]:
-        page_quiz_autogen(actor)
-    with tabs[7]:
-        page_audit_log()
-
-
-# ---------------------------------------------------------------------------
-# Основний layout
-# ---------------------------------------------------------------------------
-def main():
-    if "user_id" not in st.session_state:
-        login_screen()
-        return
-
-    user = get_user_by_id(st.session_state["user_id"])
-    if user is None:
-        del st.session_state["user_id"]
-        st.rerun()
-        return
-
+    # --- Бічна панель
     with st.sidebar:
-        st.markdown(f"### 👤 {user['full_name']}")
-        st.caption(f"{user['position']} · {ROLE_LABELS.get(user['role'], user['role'])}")
-        st.caption(f"{user['branch']}")
-        if user["is_new_hire"]:
-            st.info("🧭 Новий співробітник — активна програма адаптації")
-        llm_badge = "🟢 AI онлайн" if llm_client.is_llm_configured() else "⚪ AI: fallback-режим"
-        st.caption(f"{llm_badge} · {auth.auth_mode_label()}")
+        st.header("⚙️ Налаштування")
+        auto = st.toggle("Автооновлення (реальний час)", value=True)
+        interval = st.slider("Інтервал оновлення, с", 2, 30, 5, disabled=not auto)
+        window_min = st.select_slider(
+            "Вікно аналізу безпеки, хв", options=[5, 15, 30, 60], value=15
+        )
+        threshold = st.slider(
+            "Поріг brute-force (невдалих спроб з 1 IP)", 5, 50, 15,
+            help="Якщо з однієї IP-адреси за вибране вікно кількість невдалих спроб "
+                 "перевищує поріг — генерується сповіщення.",
+        )
         st.divider()
-
-        menu = ["Кабінет співробітника", "База технічних знань", "🤖 Чат-асистент (RAG)",
-                "Журнал оперативних подій", "Карта підстанцій"]
-        if user["role"] in ("hr", "admin"):
-            menu.append("HR-панель")
-        if user["role"] in ("safety_admin", "admin"):
-            menu.append("Адміністрування ОП")
-        if user["role"] == "admin":
-            menu.append("🛠️ Управління системою")
-
-        choice = st.radio("Розділи", menu, label_visibility="collapsed")
-
-        st.divider()
-        if st.button("Вийти", use_container_width=True):
-            del st.session_state["user_id"]
+        st.subheader("🧪 Демонстрація")
+        if st.button("Симулювати brute-force атаку", use_container_width=True):
+            st.session_state.attack_ticks = 6
+            st.session_state.attacker = None
+        if st.button("Скинути дані симуляції", use_container_width=True):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
             st.rerun()
+        st.caption("Дані симульовані. Для продакшну підключіть реальні джерела "
+                   "(Zabbix/Prometheus, SIEM, Active Directory, Veeam тощо).")
 
-    if choice == "Кабінет співробітника":
-        st.title("Кабінет співробітника")
-        tab_names = ["Розклад / табель", "Довідки", "Відпустка / відгул",
-                     "Інструктажі та ОП", "Заявки на ЗІЗ/обладнання", "Сповіщення"]
-        if user["is_new_hire"]:
-            tab_names.append("🧭 Адаптація")
-        tabs = st.tabs(tab_names)
-        with tabs[0]:
-            page_schedule(user)
-        with tabs[1]:
-            page_certificates(user)
-        with tabs[2]:
-            page_leave(user)
-        with tabs[3]:
-            page_safety(user)
-        with tabs[4]:
-            page_equipment_requests(user)
-        with tabs[5]:
-            page_notifications(user)
-        if user["is_new_hire"]:
-            with tabs[6]:
-                page_onboarding(user)
+    st.title("🛡️ Центр моніторингу та безпеки")
 
-    elif choice == "База технічних знань":
-        st.title("База технічних знань")
-        page_knowledge_base(user)
+    run_every = f"{interval}s" if auto else None
 
-    elif choice == "🤖 Чат-асистент (RAG)":
-        st.title("Чат-асистент технічної підтримки")
-        page_rag_chat(user)
+    @st.fragment(run_every=run_every)
+    def live_dashboard() -> None:
+        tick_services()
+        tick_auth_logs()
+        tick_servers()
 
-    elif choice == "Журнал оперативних подій":
-        st.title("Журнал оперативних розпоряджень")
-        page_operational_log(user)
+        st.subheader("Загальний стан критичних систем")
+        render_overall_and_services()
+        st.divider()
 
-    elif choice == "Карта підстанцій":
-        st.title("Карта підстанцій")
-        page_substations_map(user)
+        tab_sec, tab_infra = st.tabs(["🔐 Кібербезпека та доступ", "🖥️ Інфраструктура"])
+        with tab_sec:
+            render_security(window_min, threshold)
+        with tab_infra:
+            render_infrastructure()
 
-    elif choice == "HR-панель":
-        st.title("HR-панель")
-        page_hr_panel(user)
-
-    elif choice == "Адміністрування ОП":
-        st.title("Адміністрування охорони праці")
-        page_safety_admin(user)
-
-    elif choice == "🛠️ Управління системою":
-        st.title("Управління системою")
-        st.caption("Повний адміністративний доступ: користувачі, розклади, база знань, підстанції, адаптація, AI, аудит.")
-        page_system_admin(user)
+    live_dashboard()
 
 
 if __name__ == "__main__":
