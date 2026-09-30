@@ -5,9 +5,13 @@
   1. Security & Operations Dashboard (стан систем, кібербезпека, інфраструктура)
   3. Диспетчерський та технічний хаб (SCADA/GIS/телемеханіка, аварійні сповіщення)
   4. Адміністрування контенту та інтеграцій (API/шлюзи, реєстр нормативних документів)
+  6. Інциденти (плейбуки, таймлайн, MTTA/MTTR, автостворення з критичних алертів)
+  7. Активи та відповідність (патчі, сертифікати, вразливості, ризик-скор)
+  8. Звіти та SLA (Excel-звіт, оперативне зведення)
+  9. Сповіщення (Telegram, dry-run за замовчуванням)
 
 Запуск:
-    pip install -r requirements.txt
+    pip install streamlit pandas numpy plotly openpyxl folium streamlit-folium
     streamlit run security_ops_dashboard.py
 
 Дані у цій версії СИМУЛЬОВАНІ (генеруються в реальному часі).
@@ -19,6 +23,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 from io import BytesIO
 
@@ -133,6 +141,7 @@ OT_NODES = [
 
 SEVERITIES = ["Критично", "Високий", "Середній"]
 SEV_ICON = {"Критично": "🔴", "Високий": "🟠", "Середній": "🟡"}
+SEV_ORDER = {s: i for i, s in enumerate(SEVERITIES)}
 
 # (джерело, критичність, повідомлення) — збої ПЗ диспетчерів та бригад
 ALERT_TEMPLATES = [
@@ -178,6 +187,45 @@ CATEGORIES = [
     "Наказ / розпорядження",
     "Інструкція для бригад",
 ]
+
+# --- Розділи 6–9: інциденти, активи, SLA
+INC_STATUSES = ["Відкрито", "В роботі", "Локалізовано", "Закрито"]
+SLA_TARGET = 99.9
+CRIT_LABEL = {1: "Низька", 2: "Середня", 3: "Висока"}
+
+PLAYBOOKS = {
+    "Brute-force / компрометація облікового запису": [
+        "Заблокувати IP-адресу джерела на міжмережевому екрані",
+        "Перевірити успішні входи з цього IP за останні 24 год",
+        "Примусово скинути паролі уражених облікових записів",
+        "Перевірити ввімкнення MFA для адміністративних систем",
+        "Задокументувати інцидент і повідомити керівника ІБ",
+    ],
+    "Втрата зв'язку SCADA / телемеханіки": [
+        "Повідомити чергового диспетчера та перейти на резервний канал",
+        "Перевірити канал зв'язку (GPRS/оптика) та живлення шлюзу",
+        "Перевірити міжмережевий екран між ОТ та ІТ сегментами",
+        "Зафіксувати час втрати та відновлення для звіту",
+    ],
+    "Збій API-шлюзу": [
+        "Перевірити логи шлюзу та частку помилок",
+        "Перезапустити шлюз у розділі «API та шлюзи»",
+        "Перевірити термін дії ключів і сертифікатів",
+        "Повідомити зовнішніх партнерів про можливі затримки",
+    ],
+    "Збій ПЗ диспетчера / бригад": [
+        "Перевірити доступність сервера реального часу / БД",
+        "Зв'язатися з диспетчером або бригадою",
+        "Перезапустити службу застосунку",
+        "Перевірити синхронізацію нарядів-допусків",
+    ],
+    "Загальний інцидент": [
+        "Оцінити вплив і залучити відповідальних",
+        "Локалізувати проблему",
+        "Відновити роботу сервісу",
+        "Провести розбір причин",
+    ],
+}
 
 
 # ----------------------------------------------------------------------------
@@ -283,6 +331,7 @@ def init_state() -> None:
     ss.backups = pd.DataFrame(backups)
 
     init_extra_state()
+    init_ext_state()
     ss.initialized = True
 
 
@@ -898,6 +947,45 @@ def init_extra_state() -> None:
     ss.audit = []
 
 
+def init_ext_state() -> None:
+    """Стан для розділів 6–9 (інциденти, активи, сповіщення). Викликати після init_extra_state()."""
+    ss = st.session_state
+    rng = ss.rng
+    now = datetime.now()
+
+    ss.incidents = []
+    ss.inc_seq = 0
+    ss.ext_cfg = {
+        "auto_incident": True,
+        "notify_min": "Критично",
+        "dry_run": True,
+        "last_alert_id": ss.alert_seq,  # уже наявні сповіщення не породжують інцидентів
+    }
+    ss.outbox = []
+
+    assets = [
+        ("SRV-BILLING-01", "Сервер", 3), ("SRV-DB-01", "Сервер", 3),
+        ("SRV-MAIL-01", "Сервер", 2), ("SRV-APP-01", "Сервер", 2),
+        ("SRV-FILE-01", "Сервер", 1), ("FW-EDGE-01", "Мережа", 3),
+        ("FW-OT-01", "Мережа", 3), ("VPN-GW-01", "Мережа", 3),
+        ("SCADA-SRV-01", "ОТ", 3), ("OIK-CLIENT-POOL", "ОТ", 2),
+        ("GIS-SRV-01", "ОТ", 2), ("RTU-GW-GPRS-01", "ОТ", 2),
+    ]
+    ss.assets = [
+        {
+            "name": name,
+            "kind": kind,
+            "crit": crit,  # 1 - низька, 2 - середня, 3 - висока
+            "os": str(rng.choice(["Ubuntu 22.04", "Windows Server 2019", "RHEL 9", "Cisco IOS", "Debian 12"])),
+            "patched": now - timedelta(days=int(rng.integers(3, 140))),
+            "cert_exp": now + timedelta(days=int(rng.integers(-5, 300))),
+            "vuln_crit": int(rng.choice([0, 0, 0, 1, 2])),
+            "vuln_high": int(rng.integers(0, 6)),
+        }
+        for name, kind, crit in assets
+    ]
+
+
 # ----------------------------------------------------------------------------
 # Симуляція: ОТ-системи та API-шлюзи (замініть на реальні джерела)
 # ----------------------------------------------------------------------------
@@ -1006,6 +1094,7 @@ def tick_all() -> None:
     tick_servers()
     tick_ot()
     tick_gateways()
+    process_new_alerts()  # автоінциденти та сповіщення (розділи 6 та 9)
 
 
 def force_ot_outage() -> None:
@@ -1025,13 +1114,15 @@ def render_global_kpis() -> None:
     crit = sum(1 for a in active if a["severity"] == "Критично")
     ot_bad = sum(1 for s in ss.ot.values() if s["status"] != STATUS_OK)
     api_bad = sum(1 for g in ss.gateways.values() if g["status"] in (STATUS_WARN, STATUS_DOWN))
+    open_inc = sum(1 for i in ss.incidents if i["status"] != "Закрито")
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Активні критичні алерти", crit, delta="потрібна реакція" if crit else "норма",
               delta_color="inverse")
     k2.metric("ОТ-інтеграцій із проблемами", f"{ot_bad} / {len(ss.ot)}")
     k3.metric("API-шлюзів із проблемами", f"{api_bad} / {len(ss.gateways)}")
-    k4.metric("Документів у реєстрі", len(ss.docs))
+    k4.metric("Відкритих інцидентів", open_inc)
+    k5.metric("Документів у реєстрі", len(ss.docs))
 
 
 # ----------------------------------------------------------------------------
@@ -1514,6 +1605,400 @@ def render_docs(role: str) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Розділ 6: Інциденти
+# ----------------------------------------------------------------------------
+def pick_playbook(source: str, message: str) -> str:
+    text = f"{source} {message}".lower()
+    if "brute" in text or "злам" in text or "авториз" in text:
+        return "Brute-force / компрометація облікового запису"
+    if "scada" in text or "rtu" in text or "телемех" in text or ("оік" in text and "зв'язок" in text):
+        return "Втрата зв'язку SCADA / телемеханіки"
+    if "api" in text or "шлюз" in text:
+        return "Збій API-шлюзу"
+    if "диспетчер" in text or "бригад" in text or "наряд" in text:
+        return "Збій ПЗ диспетчера / бригад"
+    return "Загальний інцидент"
+
+
+def create_incident(title: str, severity: str, alert_id: int | None = None,
+                    playbook: str | None = None, who: str = "авто") -> dict:
+    ss = st.session_state
+    ss.inc_seq += 1
+    src, msg = "", title
+    if alert_id:
+        for a in ss.alerts:
+            if a["id"] == alert_id:
+                src, msg = a["source"], a["message"]
+    pb = playbook or pick_playbook(src, msg)
+    inc = {
+        "id": f"INC-{ss.inc_seq:03d}",
+        "title": title,
+        "severity": severity,
+        "status": "Відкрито",
+        "assignee": "",
+        "created": datetime.now(),
+        "acked": None,
+        "closed": None,
+        "alert_id": alert_id,
+        "playbook": pb,
+        "steps": {s: False for s in PLAYBOOKS[pb]},
+        "timeline": [(datetime.now(), who, f"Інцидент створено ({severity})")],
+    }
+    ss.incidents.append(inc)
+    add_audit("Інцидент", f"Створено {inc['id']}: {title}")
+    return inc
+
+
+def _set_status(inc: dict, new: str, who: str) -> None:
+    if new == inc["status"]:
+        return
+    now = datetime.now()
+    if new != "Відкрито" and inc["acked"] is None:
+        inc["acked"] = now
+    if new == "Закрито":
+        inc["closed"] = now
+        for a in st.session_state.alerts:
+            if a["id"] == inc["alert_id"] and a["status"] != "Вирішено":
+                a["status"], a["by"] = "Вирішено", who
+    else:
+        inc["closed"] = None
+    inc["timeline"].append((now, who, f"Статус: {inc['status']} → {new}"))
+    inc["status"] = new
+    add_audit("Інцидент", f"{inc['id']}: статус {new}")
+
+
+def _fmt_minutes(values: list[float]) -> str:
+    if not values:
+        return "—"
+    m = sum(values) / len(values)
+    return f"{m:.0f} хв" if m < 120 else f"{m / 60:.1f} год"
+
+
+def render_incidents(role: str) -> None:
+    ss = st.session_state
+    can = ROLES[role]["ack"]
+    incs = ss.incidents
+    open_ = [i for i in incs if i["status"] != "Закрито"]
+    mtta = [(i["acked"] - i["created"]).total_seconds() / 60 for i in incs if i["acked"]]
+    mttr = [(i["closed"] - i["created"]).total_seconds() / 60 for i in incs if i["closed"]]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Відкритих інцидентів", len(open_))
+    k2.metric("Критичних відкритих", sum(1 for i in open_ if i["severity"] == "Критично"))
+    k3.metric("MTTA (середній час реакції)", _fmt_minutes(mtta))
+    k4.metric("MTTR (середній час вирішення)", _fmt_minutes(mttr))
+
+    if can:
+        with st.expander("➕ Створити інцидент"):
+            active = [a for a in ss.alerts if a["status"] != "Вирішено"]
+            with st.form("form_new_inc", clear_on_submit=True):
+                title = st.text_input("Назва інциденту")
+                c1, c2, c3 = st.columns(3)
+                sev = c1.selectbox("Критичність", SEVERITIES)
+                alert_id = c2.selectbox(
+                    "Пов'язане сповіщення", [None] + [a["id"] for a in active],
+                    format_func=lambda i: "—" if i is None else
+                    next(f"#{a['id']} · {a['message'][:50]}" for a in active if a["id"] == i),
+                )
+                pb = c3.selectbox("Плейбук", ["(авто)"] + list(PLAYBOOKS))
+                ok = st.form_submit_button("Створити")
+            if ok:
+                if not title.strip():
+                    st.error("Вкажіть назву.")
+                else:
+                    inc = create_incident(title.strip(), sev, alert_id,
+                                          None if pb == "(авто)" else pb, who=role)
+                    st.success(f"Створено {inc['id']}.")
+                    st.rerun()
+
+    st.subheader("🧯 Реєстр інцидентів")
+    if not incs:
+        st.info("Інцидентів поки немає. Критичні алерти створюють їх автоматично "
+                "(налаштування — у вкладці «Сповіщення»).")
+        return
+
+    df = pd.DataFrame([
+        {
+            "Код": i["id"],
+            "Критичність": f"{SEV_ICON[i['severity']]} {i['severity']}",
+            "Назва": i["title"],
+            "Статус": i["status"],
+            "Відповідальний": i["assignee"] or "—",
+            "Створено": i["created"],
+            "Кроки плейбука": f"{sum(i['steps'].values())}/{len(i['steps'])}",
+        }
+        for i in sorted(incs, key=lambda x: (x["status"] == "Закрито", SEV_ORDER[x["severity"]], x["created"]))
+    ])
+    st.dataframe(df, hide_index=True, width="stretch",
+                 column_config={"Створено": st.column_config.DatetimeColumn(format="DD.MM HH:mm")})
+
+    by_id = {i["id"]: i for i in incs}
+    sel = st.selectbox("Інцидент для роботи", list(by_id), key="inc_sel",
+                       format_func=lambda k: f"{k} · {by_id[k]['title']}")
+    inc = by_id[sel]
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown(f"**Плейбук:** {inc['playbook']}")
+        for n, step in enumerate(inc["steps"]):
+            val = st.checkbox(step, value=inc["steps"][step], key=f"pb_{inc['id']}_{n}", disabled=not can)
+            if val != inc["steps"][step]:
+                inc["steps"][step] = val
+                inc["timeline"].append((datetime.now(), role, f"{'Виконано' if val else 'Знято'}: {step}"))
+        if can:
+            with st.form(f"comment_{inc['id']}", clear_on_submit=True):
+                text = st.text_input("Коментар")
+                if st.form_submit_button("Додати коментар") and text.strip():
+                    inc["timeline"].append((datetime.now(), role, text.strip()))
+                    st.rerun()
+    with right:
+        if can:
+            new_status = st.selectbox("Статус", INC_STATUSES, index=INC_STATUSES.index(inc["status"]),
+                                      key=f"st_{inc['id']}")
+            assignee = st.text_input("Відповідальний", inc["assignee"], key=f"as_{inc['id']}")
+            if st.button("Застосувати", key=f"apply_{inc['id']}", width="stretch"):
+                if assignee != inc["assignee"]:
+                    inc["timeline"].append((datetime.now(), role, f"Відповідальний: {assignee or '—'}"))
+                    inc["assignee"] = assignee
+                _set_status(inc, new_status, role)
+                st.rerun()
+        else:
+            st.info("Режим перегляду: змінювати інциденти можуть диспетчери, ІБ та адміністратори.")
+
+    with st.expander("🕓 Таймлайн", expanded=True):
+        st.dataframe(
+            pd.DataFrame(inc["timeline"][::-1], columns=["Час", "Хто", "Подія"]),
+            hide_index=True, width="stretch",
+            column_config={"Час": st.column_config.DatetimeColumn(format="DD.MM HH:mm:ss")},
+        )
+
+
+# ----------------------------------------------------------------------------
+# Розділ 7: Активи та відповідність
+# ----------------------------------------------------------------------------
+def assets_df() -> pd.DataFrame:
+    now = datetime.now()
+    rows = []
+    for a in st.session_state.assets:
+        patch_age = (now - a["patched"]).days
+        cert_left = (a["cert_exp"] - now).days
+        risk = (a["vuln_crit"] * 5 + a["vuln_high"] * 2
+                + (3 if patch_age > 60 else 0) + (4 if cert_left < 30 else 0)) * a["crit"]
+        rows.append({
+            "Актив": a["name"], "Тип": a["kind"], "ОС": a["os"],
+            "Критичність": CRIT_LABEL[a["crit"]],
+            "Вік патчу, дн": patch_age, "Сертифікат, дн до кінця": cert_left,
+            "Крит. вразл.": a["vuln_crit"], "Висок. вразл.": a["vuln_high"],
+            "Ризик-скор": risk,
+        })
+    return pd.DataFrame(rows).sort_values("Ризик-скор", ascending=False)
+
+
+def render_assets(role: str) -> None:
+    ss = st.session_state
+    df = assets_df()
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Активів у реєстрі", len(df))
+    k2.metric("Патч старше 60 днів", int((df["Вік патчу, дн"] > 60).sum()), delta_color="inverse")
+    k3.metric("Сертифікатів < 30 днів", int((df["Сертифікат, дн до кінця"] < 30).sum()), delta_color="inverse")
+    k4.metric("Критичних вразливостей", int(df["Крит. вразл."].sum()), delta_color="inverse")
+
+    expired = df[df["Сертифікат, дн до кінця"] < 0]
+    if not expired.empty:
+        st.error("Прострочені сертифікати: " + ", ".join(expired["Актив"]))
+
+    st.subheader("🧩 Реєстр активів і стан відповідності")
+    st.dataframe(
+        df, hide_index=True, width="stretch",
+        column_config={"Ризик-скор": st.column_config.ProgressColumn(
+            min_value=0, max_value=max(int(df["Ризик-скор"].max()), 1), format="%d")},
+    )
+
+    fig = px.bar(df.head(8), x="Ризик-скор", y="Актив", orientation="h", color="Тип",
+                 labels={"Актив": ""})
+    fig.update_yaxes(autorange="reversed")
+    fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, width="stretch", key="asset_risk")
+
+    if not ROLES[role]["upload"]:
+        st.info("Режим перегляду: змінювати статус активів можуть «Спеціаліст з ІБ» та «Адміністратор».")
+        return
+
+    st.subheader("🔧 Дії з активом")
+    name = st.selectbox("Актив", [a["name"] for a in ss.assets], key="asset_sel")
+    asset = next(a for a in ss.assets if a["name"] == name)
+    c1, c2 = st.columns(2)
+    if c1.button("🩹 Позначити пропатченим", width="stretch"):
+        asset.update(patched=datetime.now(), vuln_crit=0, vuln_high=0)
+        add_audit("Актив", f"Пропатчено: {name}")
+        st.rerun()
+    if c2.button("🔐 Сертифікат оновлено (+365 дн)", width="stretch"):
+        asset["cert_exp"] = datetime.now() + timedelta(days=365)
+        add_audit("Актив", f"Оновлено сертифікат: {name}")
+        st.rerun()
+
+
+# ----------------------------------------------------------------------------
+# Розділ 8: Звіти та SLA
+# ----------------------------------------------------------------------------
+def build_summary() -> str:
+    ss = st.session_state
+    active = [a for a in ss.alerts if a["status"] != "Вирішено"]
+    crit = [a for a in active if a["severity"] == "Критично"]
+    open_inc = [i for i in ss.incidents if i["status"] != "Закрито"]
+    bad_svc = [n for n, s in ss.services.items() if s["status"] != STATUS_OK]
+    bad_gw = [n for n, g in ss.gateways.items() if g["status"] in (STATUS_WARN, STATUS_DOWN)]
+    lines = [
+        f"Оперативне зведення на {datetime.now():%d.%m.%Y %H:%M}",
+        "",
+        f"Сервіси з проблемами: {', '.join(bad_svc) or 'немає'}",
+        f"API-шлюзи з проблемами: {', '.join(bad_gw) or 'немає'}",
+        f"Активних сповіщень: {len(active)} (критичних: {len(crit)})",
+        f"Відкритих інцидентів: {len(open_inc)}",
+    ]
+    for a in crit[:10]:
+        lines.append(f"  - #{a['id']} [{a['source']}] {a['message']}")
+    return "\n".join(lines)
+
+
+def build_report_xlsx() -> bytes:
+    ss = st.session_state
+    sheets = {
+        "Алерти": pd.DataFrame(ss.alerts).drop(columns=["link"], errors="ignore"),
+        "Інциденти": pd.DataFrame([
+            {k: v for k, v in i.items() if k not in ("steps", "timeline")} for i in ss.incidents
+        ]),
+        "Шлюзи": pd.DataFrame([
+            {"Шлюз": n, "Статус": g["status"], "RPS": round(g["rps"], 1), "p95": round(g["p95"]),
+             "Помилки %": round(g["err"], 1)} for n, g in ss.gateways.items()
+        ]),
+        "Активи": assets_df(),
+        "Журнал дій": pd.DataFrame(ss.audit),
+    }
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for name, frame in sheets.items():
+            # порожній DataFrame без колонок openpyxl записати не може — додаємо заглушку
+            if frame.empty and len(frame.columns) == 0:
+                frame = pd.DataFrame({"Дані": ["Записів немає"]})
+            frame.to_excel(w, index=False, sheet_name=name)
+    return buf.getvalue()
+
+
+def render_reports(role: str) -> None:
+    ss = st.session_state
+    st.subheader("📈 SLA сервісів")
+    rows = [
+        {"Сервіс": n, "Uptime, %": round(s["uptime"], 3), "Ціль, %": SLA_TARGET,
+         "SLA": "🟢 Виконано" if s["uptime"] >= SLA_TARGET else "🔴 Порушено"}
+        for n, s in ss.services.items()
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    st.subheader("📝 Оперативне зведення")
+    summary = build_summary()
+    st.code(summary, language=None)
+
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ Зведення (.txt)", data=summary.encode("utf-8"),
+                       file_name=f"summary_{datetime.now():%Y%m%d_%H%M}.txt", width="stretch")
+    if ROLES[role]["audit"]:
+        c2.download_button(
+            "📥 Повний звіт (Excel)", data=build_report_xlsx(),
+            file_name=f"report_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            on_click=add_audit, args=("Звіт", "Експорт повного звіту"),
+        )
+    else:
+        c2.caption("Повний звіт доступний ролям ІБ та Адміністратор.")
+
+
+# ----------------------------------------------------------------------------
+# Розділ 9: Сповіщення (Telegram) + обробка нових алертів
+# ----------------------------------------------------------------------------
+def _secret(name: str) -> str:
+    try:
+        return str(st.secrets.get(name, "")) or os.environ.get(name, "")
+    except Exception:
+        return os.environ.get(name, "")
+
+
+def send_telegram(text: str, token: str, chat_id: str) -> tuple[bool, str]:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=8) as r:
+            return json.loads(r.read()).get("ok", False), "OK"
+    except Exception as e:  # мережеві помилки не повинні ламати дашборд
+        return False, str(e)[:120]
+
+
+def notify(text: str, severity: str) -> None:
+    ss = st.session_state
+    cfg = ss.ext_cfg
+    token = cfg.get("token") or _secret("TELEGRAM_BOT_TOKEN")
+    chat = cfg.get("chat") or _secret("TELEGRAM_CHAT_ID")
+    if cfg["dry_run"] or not (token and chat):
+        status = "dry-run" if cfg["dry_run"] else "не налаштовано"
+    else:
+        ok, info = send_telegram(text, token, chat)
+        status = "надіслано" if ok else f"помилка: {info}"
+    ss.outbox.append({"Час": datetime.now(), "Критичність": severity, "Текст": text, "Статус": status})
+    ss.outbox = ss.outbox[-200:]
+
+
+def process_new_alerts() -> None:
+    """Після кожного тіку: автоінциденти та сповіщення для нових алертів."""
+    ss = st.session_state
+    cfg = ss.ext_cfg
+    new = [a for a in ss.alerts if a["id"] > cfg["last_alert_id"]]
+    for a in new:
+        if cfg["auto_incident"] and a["severity"] == "Критично":
+            create_incident(a["message"], a["severity"], alert_id=a["id"])
+        if SEV_ORDER[a["severity"]] <= SEV_ORDER[cfg["notify_min"]]:
+            notify(f"[{a['severity']}] {a['source']}: {a['message']}", a["severity"])
+    if new:
+        cfg["last_alert_id"] = max(a["id"] for a in new)
+
+
+def render_notifications(role: str) -> None:
+    ss = st.session_state
+    cfg = ss.ext_cfg
+    admin = ROLES[role]["upload"]
+
+    st.subheader("🔔 Правила автоматизації та сповіщень")
+    if not admin:
+        st.info("Налаштування доступні ролям ІБ та Адміністратор.")
+    c1, c2, c3 = st.columns(3)
+    cfg["auto_incident"] = c1.toggle("Автостворення інцидентів із критичних алертів",
+                                     cfg["auto_incident"], disabled=not admin)
+    cfg["notify_min"] = c2.selectbox("Надсилати від критичності", SEVERITIES,
+                                     index=SEVERITIES.index(cfg["notify_min"]), disabled=not admin)
+    cfg["dry_run"] = c3.toggle("Dry-run (не надсилати реально)", cfg["dry_run"], disabled=not admin)
+
+    if admin:
+        with st.expander("Telegram-бот"):
+            st.caption("Краще задати TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у .streamlit/secrets.toml "
+                       "або змінних середовища. Значення нижче зберігаються лише в сесії.")
+            cfg["token"] = st.text_input("Bot token", cfg.get("token", ""), type="password")
+            cfg["chat"] = st.text_input("Chat ID", cfg.get("chat", ""))
+            if st.button("Надіслати тестове повідомлення"):
+                notify("Тестове сповіщення з Центру моніторингу", "Середній")
+                add_audit("Сповіщення", "Тестове повідомлення")
+                st.rerun()
+
+    st.subheader("📤 Вихідна черга")
+    if ss.outbox:
+        st.dataframe(pd.DataFrame(ss.outbox[::-1][:100]), hide_index=True, width="stretch",
+                     column_config={"Час": st.column_config.DatetimeColumn(format="DD.MM HH:mm:ss")})
+    else:
+        st.caption("Сповіщень поки не було.")
+
+
+# ----------------------------------------------------------------------------
 # Головна програма
 # ----------------------------------------------------------------------------
 def main() -> None:
@@ -1565,13 +2050,18 @@ def main() -> None:
     header_live()
     st.divider()
 
-    tab_sec, tab_infra, tab_ot, tab_api, tab_docs = st.tabs(
+    (tab_sec, tab_infra, tab_ot, tab_api, tab_docs,
+     tab_inc, tab_assets, tab_rep, tab_notif) = st.tabs(
         [
             "🔐 Кібербезпека та доступ",
             "🖥️ Інфраструктура",
             "📡 Диспетчерський хаб (ОТ)",
             "🔗 API та шлюзи",
             "📚 Реєстр документів",
+            "🧯 Інциденти",
+            "🧩 Активи",
+            "📈 Звіти та SLA",
+            "🔔 Сповіщення",
         ]
     )
 
@@ -1603,8 +2093,21 @@ def main() -> None:
 
         api_live()
 
+    # Наступні вкладки — без автооновлення, щоб не збивати форми, чекбокси та завантаження
     with tab_docs:
-        render_docs(role)  # без автооновлення, щоб не збивати форми завантаження
+        render_docs(role)
+
+    with tab_inc:
+        render_incidents(role)
+
+    with tab_assets:
+        render_assets(role)
+
+    with tab_rep:
+        render_reports(role)
+
+    with tab_notif:
+        render_notifications(role)
 
 
 if __name__ == "__main__":
