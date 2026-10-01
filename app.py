@@ -11,6 +11,9 @@
   9. Сповіщення (Telegram, dry-run за замовчуванням)
   10. Збереження стану: інциденти, документи, журнал дій, метрики -> SQLite / PostgreSQL
   11. Прогноз заповнення дисків (лінійний тренд) та виявлення аномалій (z-score)
+  12. Оперативний журнал переключень (стан комутаційних апаратів, блокування, хто/коли/за яким нарядом)
+  13. GIS: імпорт/експорт схем мереж (GeoJSON, KML) замість демо-координат
+  14. Метеомоніторинг підстанцій (вітер, ожеледь, грози) із прив'язкою до алертів
 
 Запуск:
     pip install streamlit pandas numpy plotly openpyxl sqlalchemy folium streamlit-folium
@@ -34,6 +37,10 @@ import functools
 import hashlib
 import json
 import os
+import re
+import xml.etree.ElementTree as ET
+import zlib
+from xml.sax.saxutils import escape as xml_escape
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -43,6 +50,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 try:
@@ -176,7 +184,7 @@ ALERT_TEMPLATES = [
     ("Наряди-допуски", "Високий", "Помилка формування наряду-допуску (БД недоступна)"),
 ]
 ALERT_SOURCES = sorted(
-    {t[0] for t in ALERT_TEMPLATES} | {i[1] for i in OT_INTEGRATIONS} | {"API-шлюз", "Інфраструктура"}
+    {t[0] for t in ALERT_TEMPLATES} | {i[1] for i in OT_INTEGRATIONS} | {"API-шлюз", "Інфраструктура", "Метеомоніторинг"}
 )
 
 # --- Розділ 4: API-шлюзи (назва, ендпоінт, протокол, базовий RPS, ліміт RPS, базова затримка мс)
@@ -192,12 +200,12 @@ GATEWAYS = [
 
 # --- Ролі та рівні секретності документів
 # clear — макс. рівень допуску; upload — може завантажувати/керувати; ack — обробка алертів;
-# audit — бачить журнал дій
+# audit — бачить журнал дій; switch — може виконувати переключення в оперативному журналі
 ROLES = {
-    "Працівник": {"clear": 1, "upload": False, "ack": False, "audit": False},
-    "Диспетчер": {"clear": 2, "upload": False, "ack": True, "audit": False},
-    "Спеціаліст з ІБ": {"clear": 3, "upload": True, "ack": True, "audit": True},
-    "Адміністратор": {"clear": 3, "upload": True, "ack": True, "audit": True},
+    "Працівник": {"clear": 1, "upload": False, "ack": False, "audit": False, "switch": False},
+    "Диспетчер": {"clear": 2, "upload": False, "ack": True, "audit": False, "switch": True},
+    "Спеціаліст з ІБ": {"clear": 3, "upload": True, "ack": True, "audit": True, "switch": False},
+    "Адміністратор": {"clear": 3, "upload": True, "ack": True, "audit": True, "switch": True},
 }
 LEVELS = {0: "Публічний", 1: "Внутрішній", 2: "Для службового користування", 3: "Конфіденційний"}
 LEVEL_ICON = {0: "🟢", 1: "🔵", 2: "🟠", 3: "🔴"}
@@ -366,6 +374,7 @@ def init_state() -> None:
 
     init_extra_state()
     init_ext_state()
+    init_switch_state()
     load_persistent_state()  # відновлення збереженого стану з БД
     ss.initialized = True
 
@@ -898,6 +907,54 @@ if HAS_DB:
     )
 
 
+if HAS_DB:
+    t_swdev = Table(
+        "switch_devices", _meta,
+        Column("id", String(190), primary_key=True),
+        Column("node", String(128)),
+        Column("bay", String(64)),
+        Column("name", String(128)),
+        Column("kind", String(32)),
+        Column("state", String(16)),
+        Column("updated", DateTime),
+        Column("updated_by", String(128)),
+    )
+    t_swlog = Table(
+        "switch_log", _meta,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("ts", DateTime, index=True),
+        Column("node", String(128), index=True),
+        Column("device_id", String(190)),
+        Column("device", String(128)),
+        Column("kind", String(32)),
+        Column("from_state", String(16)),
+        Column("to_state", String(16)),
+        Column("operator", String(128)),
+        Column("role", String(64)),
+        Column("order_no", String(64)),
+        Column("reason", Text),
+        Column("auto", Integer),
+    )
+    t_gis = Table(
+        "gis_layers", _meta,
+        Column("id", String(32), primary_key=True),
+        Column("name", String(255)),
+        Column("kind", String(16)),
+        Column("source", String(255)),
+        Column("uploaded", DateTime),
+        Column("visible", Integer),
+        Column("geojson", Text),
+    )
+    t_node = Table(
+        "ot_nodes", _meta,
+        Column("name", String(128), primary_key=True),
+        Column("kind", String(64)),
+        Column("lat", Float),
+        Column("lon", Float),
+        Column("parent", String(190)),
+    )
+
+
 def _json_default(o):
     if isinstance(o, datetime):
         return o.isoformat()
@@ -1071,7 +1128,7 @@ def db_load_metrics(n_rows: int):
 @db_safe()
 def db_clear_all() -> None:
     with get_engine().begin() as c:
-        for t in (t_audit, t_inc, t_doc, t_met):
+        for t in (t_audit, t_inc, t_doc, t_met, t_swdev, t_swlog, t_gis, t_node):
             c.execute(delete(t))
 
 
@@ -1083,6 +1140,7 @@ def load_persistent_state() -> None:
     n_docs = db_count_docs()
     if n_docs is None:  # БД недоступна — працюємо в пам'яті
         return
+    load_persistent_ot()
 
     if n_docs == 0:
         for d in ss.docs:
@@ -1293,6 +1351,985 @@ def render_forecast() -> None:
         )
     st.caption(f"Останні 10 вимірів порівнюються з базовим рівнем попередніх точок; "
                f"|z| ≥ {z_thr} вважається аномалією. Для диска аналізується приріст між вимірами.")
+
+
+# --- розділ 12–13: апарати, журнал переключень, шари GIS, координати вузлів
+@db_safe()
+def db_save_device(d: dict) -> None:
+    vals = dict(id=d["id"], node=d["node"], bay=d["bay"], name=d["name"], kind=d["kind"], state=d["state"],
+                updated=d["updated"], updated_by=d["updated_by"])
+    with get_engine().begin() as c:
+        _upsert(c, t_swdev, "id", vals)
+
+
+@db_safe(None)
+def db_count_devices():
+    with get_engine().connect() as c:
+        return int(c.execute(select(func.count()).select_from(t_swdev)).scalar())
+
+
+@db_safe(None)
+def db_load_devices():
+    with get_engine().connect() as c:
+        return [dict(r) for r in c.execute(select(t_swdev)).mappings().all()]
+
+
+@db_safe()
+def db_add_switch(e: dict) -> None:
+    with get_engine().begin() as c:
+        c.execute(insert(t_swlog).values(
+            ts=e["ts"], node=e["node"], device_id=e["device_id"], device=e["device"], kind=e["kind"],
+            from_state=e["from_state"], to_state=e["to_state"], operator=e["operator"], role=e["role"],
+            order_no=e["order_no"], reason=e["reason"], auto=int(e["auto"])))
+
+
+@db_safe(None)
+def db_load_switch_log(limit: int = 1000):
+    with get_engine().connect() as c:
+        rows = c.execute(select(t_swlog).order_by(t_swlog.c.id.desc()).limit(limit)).mappings().all()
+    return [{
+        "ts": r["ts"], "node": r["node"], "device_id": r["device_id"], "device": r["device"], "kind": r["kind"],
+        "from_state": r["from_state"], "to_state": r["to_state"], "operator": r["operator"], "role": r["role"],
+        "order_no": r["order_no"], "reason": r["reason"] or "", "auto": bool(r["auto"]),
+    } for r in reversed(rows)]
+
+
+@db_safe()
+def db_save_gis_layer(L: dict) -> None:
+    vals = dict(id=L["id"], name=L["name"], kind=L["kind"], source=L["source"], uploaded=L["uploaded"],
+                visible=int(L["visible"]), geojson=json.dumps(L["geojson"], ensure_ascii=False))
+    with get_engine().begin() as c:
+        _upsert(c, t_gis, "id", vals)
+
+
+@db_safe()
+def db_delete_gis_layer(layer_id: str) -> None:
+    with get_engine().begin() as c:
+        c.execute(delete(t_gis).where(t_gis.c.id == layer_id))
+
+
+@db_safe(None)
+def db_load_gis_layers():
+    with get_engine().connect() as c:
+        rows = c.execute(select(t_gis).order_by(t_gis.c.uploaded)).mappings().all()
+    return [{"id": r["id"], "name": r["name"], "kind": r["kind"], "source": r["source"], "uploaded": r["uploaded"],
+             "visible": bool(r["visible"]), "geojson": json.loads(r["geojson"])} for r in rows]
+
+
+@db_safe()
+def db_save_node(n: dict) -> None:
+    vals = dict(name=n["name"], kind=n["kind"], lat=float(n["lat"]), lon=float(n["lon"]), parent=n["parent"])
+    with get_engine().begin() as c:
+        _upsert(c, t_node, "name", vals)
+
+
+@db_safe()
+def db_clear_nodes() -> None:
+    with get_engine().begin() as c:
+        c.execute(delete(t_node))
+
+
+@db_safe(None)
+def db_load_nodes():
+    with get_engine().connect() as c:
+        return [dict(r) for r in c.execute(select(t_node)).mappings().all()]
+
+
+def load_persistent_ot() -> None:
+    """Відновлення координат вузлів, станів апаратів, журналу переключень та шарів GIS."""
+    ss = st.session_state
+    rows = db_load_nodes()
+    if rows:
+        by = {n["name"]: n for n in ss.nodes}
+        for r in rows:
+            if r["name"] in by:
+                by[r["name"]].update(lat=r["lat"], lon=r["lon"])
+            elif r["parent"] in ss.ot:
+                ss.nodes.append({"name": r["name"], "kind": r["kind"], "lat": r["lat"], "lon": r["lon"],
+                                 "parent": r["parent"], "status": NODE_OK})
+    for n in ss.nodes:
+        ensure_node_devices(n)
+
+    cnt = db_count_devices()
+    if cnt == 0:
+        for d in ss.sw_devices.values():
+            db_save_device(d)
+    elif cnt:
+        for r in db_load_devices() or []:
+            if r["id"] in ss.sw_devices:
+                ss.sw_devices[r["id"]].update(state=r["state"], updated=r["updated"], updated_by=r["updated_by"])
+
+    log = db_load_switch_log()
+    if log:
+        ss.sw_log = log
+    layers = db_load_gis_layers()
+    if layers:
+        ss.gis_layers = layers
+
+
+# ----------------------------------------------------------------------------
+# Розділ 12: Оперативний журнал переключень
+# ----------------------------------------------------------------------------
+SW_ON, SW_OFF = "Увімкнено", "Вимкнено"
+SW_KINDS = ("Вимикач", "Роз'єднувач", "Заземлювач")
+AUTO_OPERATOR = "РЗА (автоматично)"
+
+
+def state_text(kind: str, state: str) -> str:
+    if kind == "Заземлювач":
+        return "Заземлено" if state == SW_ON else "Знято"
+    return state
+
+
+def state_badge(kind: str, state: str) -> str:
+    on = state == SW_ON
+    if kind == "Заземлювач":
+        return "⏚ Заземлено" if on else "— Знято"
+    return "⚡ Увімкнено" if on else "⭕ Вимкнено"
+
+
+def make_node_devices(node: dict) -> list[dict]:
+    """Типовий склад комутаційних апаратів вузла (демо). Замініть даними з ОІК/паспорта підстанції."""
+    if node["kind"].startswith("ПС"):
+        bays = [("Т1 110 кВ", "110"), ("Л-35 №1", "35")]
+    else:
+        bays = [("Ф-1", "10"), ("Ф-2", "10")]
+    devs = []
+    for bay, kv in bays:
+        for kind, prefix in zip(SW_KINDS, ("В", "Р", "ЗН")):
+            name = f"{prefix}-{kv} ({bay})"
+            devs.append({
+                "id": f"{node['name']}::{name}", "node": node["name"], "bay": bay, "name": name,
+                "kind": kind, "state": SW_OFF if kind == "Заземлювач" else SW_ON,
+                "updated": datetime.now(), "updated_by": "початковий стан",
+            })
+    return devs
+
+
+def ensure_node_devices(node: dict) -> None:
+    ss = st.session_state
+    for d in make_node_devices(node):
+        ss.sw_devices.setdefault(d["id"], d)
+
+
+def init_switch_state() -> None:
+    ss = st.session_state
+    ss.sw_devices = {}
+    ss.sw_log = []
+    ss.gis_layers = []
+    ss.wx_alerted = set()
+    ss.wx_risk = {}
+    for n in ss.nodes:
+        ensure_node_devices(n)
+
+
+def check_interlock(dev: dict, target: str) -> tuple[bool, str]:
+    """Оперативні блокування в межах комірки (bay) + контроль зв'язку з вузлом."""
+    ss = st.session_state
+    node = next((n for n in ss.nodes if n["name"] == dev["node"]), None)
+    if node is not None and node_effective_status(node) == NODE_LOST:
+        return False, "Немає зв'язку з вузлом телемеханіки — команда неможлива."
+    bay = [d for d in ss.sw_devices.values() if d["node"] == dev["node"] and d["bay"] == dev["bay"]]
+    brk = [d for d in bay if d["kind"] == "Вимикач"]
+    dis = [d for d in bay if d["kind"] == "Роз'єднувач"]
+    ear = [d for d in bay if d["kind"] == "Заземлювач"]
+    if target == SW_ON:
+        if dev["kind"] in ("Вимикач", "Роз'єднувач") and any(e["state"] == SW_ON for e in ear):
+            return False, "Заблоковано: у комірці увімкнено заземлювач."
+        if dev["kind"] == "Роз'єднувач" and any(b["state"] == SW_ON for b in brk):
+            return False, "Заблоковано: роз'єднувач не можна вмикати при увімкненому вимикачі."
+        if dev["kind"] == "Заземлювач" and any(d["state"] == SW_ON for d in brk + dis):
+            return False, "Заблоковано: заземлити можна лише знеструмлену комірку (вимкніть вимикач і роз'єднувач)."
+    else:
+        if dev["kind"] == "Роз'єднувач" and any(b["state"] == SW_ON for b in brk):
+            return False, "Заблоковано: роз'єднувач не можна вимикати під навантаженням (спочатку вимикач)."
+    return True, ""
+
+
+def _log_switch(dev: dict, frm: str, to: str, operator: str, role: str, order_no: str, reason: str, auto: bool) -> None:
+    ss = st.session_state
+    entry = {
+        "ts": datetime.now(), "node": dev["node"], "device_id": dev["id"], "device": dev["name"],
+        "kind": dev["kind"], "from_state": frm, "to_state": to, "operator": operator, "role": role,
+        "order_no": order_no, "reason": reason, "auto": auto,
+    }
+    ss.sw_log.append(entry)
+    ss.sw_log = ss.sw_log[-3000:]
+    db_add_switch(entry)
+
+
+def operate_switch(dev_id: str, target: str, operator: str, role: str, order_no: str, reason: str) -> tuple[bool, str]:
+    ss = st.session_state
+    dev = ss.sw_devices.get(dev_id)
+    if dev is None:
+        return False, "Апарат не знайдено."
+    if dev["state"] == target:
+        return False, "Апарат уже в цьому стані."
+    ok, msg = check_interlock(dev, target)
+    if not ok:
+        return False, msg
+    frm = dev["state"]
+    dev.update(state=target, updated=datetime.now(), updated_by=f"{operator} ({role})")
+    db_save_device(dev)
+    _log_switch(dev, frm, target, operator, role, order_no, reason, auto=False)
+    if dev["kind"] == "Вимикач" and target == SW_ON:
+        resolve_links(f"sw:{dev['id']}")
+    add_audit("Переключення", f"{dev['node']}: {dev['name']} {state_text(dev['kind'], frm)} → "
+                              f"{state_text(dev['kind'], target)}; наряд {order_no}; {operator}")
+    return True, f"{dev['name']}: {state_text(dev['kind'], frm)} → {state_text(dev['kind'], target)}"
+
+
+def tick_switching() -> None:
+    """Імітація спрацювання захисту: самовільне відключення вимикача (частіше за критичної погоди)."""
+    ss = st.session_state
+    rng = ss.rng
+    if rng.random() > 0.01:
+        return
+    nodes = {n["name"]: n for n in ss.nodes}
+    cands = [d for d in ss.sw_devices.values()
+             if d["kind"] == "Вимикач" and d["state"] == SW_ON and d["node"] in nodes
+             and node_effective_status(nodes[d["node"]]) != NODE_LOST]
+    if not cands:
+        return
+    w = np.array([4.0 if ss.get("wx_risk", {}).get(d["node"]) == "Критично" else 1.0 for d in cands])
+    dev = cands[int(rng.choice(len(cands), p=w / w.sum()))]
+    dev.update(state=SW_OFF, updated=datetime.now(), updated_by=AUTO_OPERATOR)
+    db_save_device(dev)
+    _log_switch(dev, SW_ON, SW_OFF, AUTO_OPERATOR, "система", "—", "Спрацювання захисту (імітація)", auto=True)
+    sev = "Критично" if nodes[dev["node"]]["kind"].startswith("ПС") else "Високий"
+    add_alert("Телемеханіка", sev, f"Автоматичне відключення {dev['name']} на {dev['node']}", link=f"sw:{dev['id']}")
+
+
+def journal_df(entries: list[dict]) -> pd.DataFrame:
+    rows = [{
+        "Час": e["ts"], "Вузол": e["node"], "Апарат": e["device"], "Тип": e["kind"],
+        "Було": state_text(e["kind"], e["from_state"]), "Стало": state_text(e["kind"], e["to_state"]),
+        "Хто виконав": e["operator"], "Роль": e["role"], "Наряд / розпорядження №": e["order_no"],
+        "Підстава": e["reason"], "Джерело": "РЗА / автоматика" if e["auto"] else "Оператор",
+    } for e in reversed(entries)]
+    return pd.DataFrame(rows)
+
+
+def render_switching(role: str) -> None:
+    ss = st.session_state
+    can = ROLES[role]["switch"]
+    now = datetime.now()
+    day = now - timedelta(hours=24)
+
+    flash = ss.pop("sw_flash", None)
+    if flash:
+        (st.success if flash[0] == "ok" else st.error)(flash[1])
+
+    ops24 = [e for e in ss.sw_log if e["ts"] >= day]
+    devs_all = list(ss.sw_devices.values())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Вимикачів увімкнено", f"{sum(d['kind'] == 'Вимикач' and d['state'] == SW_ON for d in devs_all)}"
+                                      f" / {sum(d['kind'] == 'Вимикач' for d in devs_all)}")
+    k2.metric("Заземлень увімкнено", sum(d["kind"] == "Заземлювач" and d["state"] == SW_ON for d in devs_all))
+    k3.metric("Операцій за 24 год", sum(not e["auto"] for e in ops24))
+    k4.metric("Автовідключень за 24 год", sum(e["auto"] for e in ops24), delta_color="inverse",
+              delta="перевірте" if any(e["auto"] for e in ops24) else "норма")
+
+    st.subheader("🔀 Стан комутаційних апаратів")
+    node_names = [n["name"] for n in ss.nodes]
+    node = st.selectbox("Вузол", node_names, key="sw_node")
+    nobj = next(n for n in ss.nodes if n["name"] == node)
+    eff = node_effective_status(nobj)
+    st.caption(f"{nobj['kind']} · телеметрія: {NODE_ICON[eff]} {eff}"
+               + (" · стани можуть бути застарілими" if eff != NODE_OK else ""))
+    devs = [d for d in devs_all if d["node"] == node]
+    st.dataframe(
+        pd.DataFrame([{
+            "Комірка": d["bay"], "Апарат": d["name"], "Тип": d["kind"], "Стан": state_badge(d["kind"], d["state"]),
+            "Остання зміна": d["updated"], "Хто": d["updated_by"],
+        } for d in devs]),
+        hide_index=True, width="stretch",
+        column_config={"Остання зміна": st.column_config.DatetimeColumn(format="DD.MM HH:mm:ss")},
+    )
+
+    st.subheader("✍️ Виконання переключення")
+    if not can:
+        st.info("Режим перегляду: виконувати переключення можуть «Диспетчер» та «Адміністратор».")
+    elif devs:
+        by_id = {d["id"]: d for d in devs}
+        dev_id = st.selectbox(
+            "Апарат", list(by_id), key="sw_dev",
+            format_func=lambda i: f"{by_id[i]['bay']} · {by_id[i]['name']} — {state_text(by_id[i]['kind'], by_id[i]['state'])}",
+        )
+        dev = by_id[dev_id]
+        target = SW_OFF if dev["state"] == SW_ON else SW_ON
+        cmd = {("Заземлювач", SW_ON): "Заземлити", ("Заземлювач", SW_OFF): "Зняти заземлення",
+               (None, SW_ON): "Увімкнути", (None, SW_OFF): "Вимкнути"}
+        cmd_text = cmd.get((dev["kind"], target)) or cmd[(None, target)]
+        ok_pre, msg_pre = check_interlock(dev, target)
+        if not ok_pre:
+            st.warning(f"Команда «{cmd_text}» зараз недоступна. {msg_pre}")
+        with st.form("form_switch", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            operator = c1.text_input("Хто виконує (ПІБ / позивний)", ss.get("sw_operator", ""))
+            order_no = c2.text_input("Наряд / розпорядження №")
+            reason = st.text_input("Підстава / коментар")
+            confirm = st.checkbox(f"Підтверджую команду: {cmd_text} — {dev['name']} ({node})")
+            go_btn = st.form_submit_button(f"▶ {cmd_text}", disabled=not ok_pre)
+        if go_btn:
+            if not operator.strip() or not order_no.strip():
+                st.error("Вкажіть виконавця та номер наряду/розпорядження.")
+            elif not confirm:
+                st.error("Підтвердіть команду.")
+            else:
+                ss.sw_operator = operator.strip()
+                done, msg = operate_switch(dev_id, target, operator.strip(), role, order_no.strip(), reason.strip())
+                if done:
+                    ss.sw_flash = ("ok", f"✅ Виконано: {msg}")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.divider()
+    st.subheader("📒 Журнал переключень (незмінний, лише додавання записів)")
+    f1, f2, f3, f4 = st.columns([2, 2, 1.2, 1.2])
+    nodes_f = f1.multiselect("Вузли", node_names, key="swj_nodes")
+    q = f2.text_input("Пошук (апарат, виконавець, наряд)", key="swj_q")
+    period = f3.selectbox("Період", ["24 год", "7 днів", "Весь"], key="swj_period")
+    only_auto = f4.toggle("Лише автоматика", key="swj_auto")
+    horizon = {"24 год": timedelta(hours=24), "7 днів": timedelta(days=7)}.get(period)
+    items = [
+        e for e in ss.sw_log
+        if (not nodes_f or e["node"] in nodes_f)
+        and (horizon is None or e["ts"] >= now - horizon)
+        and (not only_auto or e["auto"])
+        and (not q or q.lower() in f"{e['device']} {e['operator']} {e['order_no']} {e['reason']}".lower())
+    ]
+    jdf = journal_df(items)
+    if jdf.empty:
+        st.info("Записів за вибраними фільтрами немає.")
+    else:
+        st.dataframe(jdf, hide_index=True, width="stretch", height=min(480, 60 + 35 * len(jdf)),
+                     column_config={"Час": st.column_config.DatetimeColumn(format="DD.MM.YYYY HH:mm:ss")})
+        if ROLES[role]["ack"]:
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                jdf.to_excel(w, index=False, sheet_name="Журнал переключень")
+            c1, c2 = st.columns(2)
+            c1.download_button("📥 Експорт (Excel)", data=buf.getvalue(),
+                               file_name=f"switch_journal_{now:%Y%m%d_%H%M}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               width="stretch", on_click=add_audit, args=("Звіт", "Експорт журналу переключень"))
+            c2.download_button("📄 Експорт (CSV)", data=jdf.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"switch_journal_{now:%Y%m%d_%H%M}.csv", mime="text/csv", width="stretch")
+
+
+# ----------------------------------------------------------------------------
+# Розділ 13: GIS — імпорт/експорт GeoJSON та KML
+# ----------------------------------------------------------------------------
+GIS_KINDS = {"lines": "Лінії електропередач", "zones": "Зони обслуговування", "points": "Об'єкти (точки)"}
+GIS_COLOR = {"lines": "#2563eb", "zones": "#f97316", "points": "#9333ea"}
+GEO_TYPES = {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
+MAX_GIS_MB = 10
+MAX_GIS_FEATURES = 20000
+
+
+def _check_coords(c) -> None:
+    if isinstance(c, (list, tuple)) and c and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in c):
+        if len(c) < 2:
+            raise ValueError("Позиція має містити щонайменше довготу та широту.")
+        if not (-180 <= c[0] <= 180 and -90 <= c[1] <= 90):
+            raise ValueError("Координати поза діапазоном WGS84 (lon −180..180, lat −90..90) — імовірно інша проєкція.")
+        return
+    if isinstance(c, (list, tuple)) and c:
+        for x in c:
+            _check_coords(x)
+        return
+    raise ValueError("Некоректні координати у геометрії.")
+
+
+def normalize_geojson(obj) -> dict:
+    """Перевіряє GeoJSON і повертає FeatureCollection з обов'язковою властивістю name."""
+    if not isinstance(obj, dict):
+        raise ValueError("Очікується JSON-об'єкт GeoJSON.")
+    t = obj.get("type")
+    if t == "FeatureCollection":
+        feats = obj.get("features") or []
+    elif t == "Feature":
+        feats = [obj]
+    elif t in GEO_TYPES or t == "GeometryCollection":
+        feats = [{"type": "Feature", "properties": {}, "geometry": obj}]
+    else:
+        raise ValueError(f"Невідомий тип GeoJSON: {t!r}.")
+    out = []
+    for f in feats:
+        if not isinstance(f, dict) or not f.get("geometry"):
+            continue
+        g = f["geometry"]
+        props = dict(f.get("properties") or {})
+        geoms = g.get("geometries", []) if g.get("type") == "GeometryCollection" else [g]
+        name = next((props[k] for k in ("name", "Name", "NAME", "title", "label") if props.get(k)), "")
+        props["name"] = str(name)
+        for gg in geoms:
+            if gg.get("type") not in GEO_TYPES:
+                raise ValueError(f"Непідтримуваний тип геометрії: {gg.get('type')!r}.")
+            _check_coords(gg.get("coordinates"))
+            out.append({"type": "Feature", "properties": props,
+                        "geometry": {"type": gg["type"], "coordinates": gg["coordinates"]}})
+        if len(out) > MAX_GIS_FEATURES:
+            raise ValueError(f"Забагато об'єктів (ліміт {MAX_GIS_FEATURES}).")
+    if not out:
+        raise ValueError("У файлі не знайдено об'єктів з геометрією.")
+    return {"type": "FeatureCollection", "features": out}
+
+
+def _kml_coords(text: str) -> list[list[float]]:
+    pts = []
+    for tok in (text or "").split():
+        parts = tok.split(",")
+        if len(parts) >= 2:
+            pts.append([float(parts[0]), float(parts[1])])
+    return pts
+
+
+def kml_to_geojson(data: bytes) -> dict:
+    low = data.lower()
+    if b"<!doctype" in low or b"<!entity" in low:
+        raise ValueError("DTD/ENTITY у KML заборонені з міркувань безпеки.")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as e:
+        raise ValueError(f"Некоректний XML/KML: {e}") from e
+
+    def tag(el) -> str:
+        return el.tag.rsplit("}", 1)[-1]
+
+    feats = []
+    for pm in root.iter():
+        if tag(pm) != "Placemark":
+            continue
+        name = next((c.text or "" for c in pm if tag(c) == "name"), "").strip()
+        desc = next((c.text or "" for c in pm if tag(c) == "description"), "").strip()
+        props = {"name": name, "description": desc}
+        for el in pm.iter():
+            t = tag(el)
+            if t == "Point":
+                c = next((_kml_coords(x.text) for x in el.iter() if tag(x) == "coordinates"), [])
+                if c:
+                    feats.append({"type": "Feature", "properties": props, "geometry": {"type": "Point", "coordinates": c[0]}})
+            elif t == "LineString":
+                c = next((_kml_coords(x.text) for x in el.iter() if tag(x) == "coordinates"), [])
+                if len(c) >= 2:
+                    feats.append({"type": "Feature", "properties": props, "geometry": {"type": "LineString", "coordinates": c}})
+            elif t == "Polygon":
+                rings = []
+                for b in el.iter():
+                    if tag(b) in ("outerBoundaryIs", "innerBoundaryIs"):
+                        c = next((_kml_coords(x.text) for x in b.iter() if tag(x) == "coordinates"), [])
+                        if len(c) >= 4:
+                            rings.append(c)
+                if rings:
+                    feats.append({"type": "Feature", "properties": props, "geometry": {"type": "Polygon", "coordinates": rings}})
+    return {"type": "FeatureCollection", "features": feats}
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def parse_gis_file(name: str, data: bytes):
+    try:
+        if len(data) > MAX_GIS_MB * 1024 * 1024:
+            return None, f"Файл перевищує ліміт {MAX_GIS_MB} МБ."
+        if name.lower().endswith(".kml"):
+            fc = normalize_geojson(kml_to_geojson(data))
+        else:
+            fc = normalize_geojson(json.loads(data.decode("utf-8-sig")))
+        return fc, None
+    except Exception as e:
+        return None, str(e)[:250]
+
+
+def fc_stats(fc: dict) -> tuple[dict, list[float]]:
+    counts: dict[str, int] = {}
+    lons, lats = [], []
+
+    def walk(c):
+        if c and isinstance(c[0], (int, float)):
+            lons.append(c[0]); lats.append(c[1])
+        else:
+            for x in c:
+                walk(x)
+
+    for f in fc["features"]:
+        g = f["geometry"]
+        counts[g["type"]] = counts.get(g["type"], 0) + 1
+        walk(g["coordinates"])
+    return counts, ([min(lats), min(lons), max(lats), max(lons)] if lats else [])
+
+
+def detect_kind(fc: dict) -> str:
+    types = {f["geometry"]["type"] for f in fc["features"]}
+    if types <= {"Point", "MultiPoint"}:
+        return "points"
+    if types <= {"Polygon", "MultiPolygon"}:
+        return "zones"
+    return "lines"
+
+
+def fc_to_kml(fc: dict, doc_name: str) -> str:
+    def pos(c): return f"{c[0]},{c[1]}"
+    def ring(r): return " ".join(pos(c) for c in r)
+
+    def geom(g: dict) -> str:
+        t, c = g["type"], g["coordinates"]
+        if t == "Point":
+            return f"<Point><coordinates>{pos(c)}</coordinates></Point>"
+        if t == "LineString":
+            return f"<LineString><coordinates>{ring(c)}</coordinates></LineString>"
+        if t == "Polygon":
+            inner = "".join(f"<innerBoundaryIs><LinearRing><coordinates>{ring(r)}</coordinates></LinearRing></innerBoundaryIs>"
+                            for r in c[1:])
+            return (f"<Polygon><outerBoundaryIs><LinearRing><coordinates>{ring(c[0])}</coordinates></LinearRing>"
+                    f"</outerBoundaryIs>{inner}</Polygon>")
+        sub = t[5:]  # Multi*
+        return "<MultiGeometry>" + "".join(geom({"type": sub, "coordinates": x}) for x in c) + "</MultiGeometry>"
+
+    body = "".join(
+        f"<Placemark><name>{xml_escape(str(f['properties'].get('name', '')))}</name>"
+        f"<description>{xml_escape(str(f['properties'].get('description', '')))}</description>{geom(f['geometry'])}</Placemark>"
+        for f in fc["features"]
+    )
+    return ('<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
+            f"<name>{xml_escape(doc_name)}</name>{body}</Document></kml>")
+
+
+def nodes_to_geojson() -> dict:
+    ss = st.session_state
+    return {"type": "FeatureCollection", "features": [{
+        "type": "Feature",
+        "properties": {"name": n["name"], "kind": n["kind"], "channel": n["parent"], "status": node_effective_status(n)},
+        "geometry": {"type": "Point", "coordinates": [n["lon"], n["lat"]]},
+    } for n in ss.nodes]}
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[\s«»\"'’`]+", " ", str(s).lower()).strip()
+
+
+def apply_points_to_nodes(fc: dict, add_new: bool, parent: str, kind: str) -> tuple[int, int, list[str]]:
+    """Оновлює координати вузлів телемеханіки з точкового шару (збіг за назвою)."""
+    ss = st.session_state
+    by = {_norm(n["name"]): n for n in ss.nodes}
+    upd = add = 0
+    unmatched: list[str] = []
+    for f in fc["features"]:
+        g = f["geometry"]
+        if g["type"] != "Point":
+            continue
+        name = str(f["properties"].get("name", "")).strip()
+        lon, lat = float(g["coordinates"][0]), float(g["coordinates"][1])
+        key = _norm(name)
+        node = by.get(key)
+        if node is None and len(key) >= 4:
+            cands = [n for k, n in by.items() if key in k or k in key]
+            node = cands[0] if len(cands) == 1 else None
+        if node is not None:
+            node.update(lat=lat, lon=lon)
+            db_save_node(node)
+            upd += 1
+        elif add_new and name:
+            new = {"name": name, "kind": kind, "lat": lat, "lon": lon, "parent": parent, "status": NODE_OK}
+            ss.nodes.append(new)
+            by[key] = new
+            ensure_node_devices(new)
+            db_save_node(new)
+            add += 1
+        else:
+            unmatched.append(name or "(без назви)")
+    return upd, add, unmatched
+
+
+def reset_nodes_to_demo() -> None:
+    ss = st.session_state
+    db_clear_nodes()
+    ss.nodes = [{"name": n, "kind": k, "lat": la, "lon": lo, "parent": p, "status": NODE_OK}
+                for n, k, la, lo, p in OT_NODES]
+    names = {n["name"] for n in ss.nodes}
+    ss.sw_devices = {i: d for i, d in ss.sw_devices.items() if d["node"] in names}
+
+
+def render_gis(role: str) -> None:
+    ss = st.session_state
+    can = ROLES[role]["upload"]
+    st.subheader("🗺️ Схеми мереж (GIS): імпорт та експорт")
+    st.caption("Підтримуються GeoJSON (.geojson/.json) та KML у системі координат WGS84. "
+               "KMZ спершу розпакуйте. Шари відображаються також на карті вкладки «Диспетчерський хаб».")
+    render_ot_map(height=520, key="gis_map")
+
+    flash = ss.pop("gis_flash", None)
+    if flash:
+        st.success(flash)
+
+    st.subheader("📚 Шари")
+    if not ss.gis_layers:
+        st.info("Шарів поки немає. Імпортуйте GeoJSON або KML нижче.")
+    for L in list(ss.gis_layers):
+        counts, _ = fc_stats(L["geojson"])
+        c = st.columns([3, 1, 1, 1, 1])
+        c[0].markdown(f"**{L['name']}** · {GIS_KINDS.get(L['kind'], L['kind'])}")  # без unsafe_allow_html: назви з файлів
+        c[0].caption(f"{L['source']} · {len(L['geojson']['features'])} об'єктів · {L['uploaded']:%d.%m.%Y %H:%M}")
+        vis = c[1].checkbox("Показати", L["visible"], key=f"gis_vis_{L['id']}")
+        if vis != L["visible"]:
+            L["visible"] = vis
+            db_save_gis_layer(L)
+            st.rerun()
+        c[2].download_button("GeoJSON", data=json.dumps(L["geojson"], ensure_ascii=False).encode("utf-8"),
+                             file_name=f"{_safe_name(L['name'])}.geojson", mime="application/geo+json",
+                             key=f"gis_dl_j_{L['id']}", width="stretch")
+        c[3].download_button("KML", data=fc_to_kml(L["geojson"], L["name"]).encode("utf-8"),
+                             file_name=f"{_safe_name(L['name'])}.kml", mime="application/vnd.google-earth.kml+xml",
+                             key=f"gis_dl_k_{L['id']}", width="stretch")
+        if can and c[4].button("🗑 Видалити", key=f"gis_del_{L['id']}", width="stretch"):
+            ss.gis_layers = [x for x in ss.gis_layers if x["id"] != L["id"]]
+            db_delete_gis_layer(L["id"])
+            add_audit("GIS", f"Видалено шар «{L['name']}»")
+            st.rerun()
+
+    st.subheader("📤 Експорт вузлів телемеханіки")
+    nfc = nodes_to_geojson()
+    e1, e2 = st.columns(2)
+    e1.download_button("Вузли → GeoJSON", data=json.dumps(nfc, ensure_ascii=False).encode("utf-8"),
+                       file_name="telemechanics_nodes.geojson", mime="application/geo+json", width="stretch")
+    e2.download_button("Вузли → KML", data=fc_to_kml(nfc, "Вузли телемеханіки").encode("utf-8"),
+                       file_name="telemechanics_nodes.kml", mime="application/vnd.google-earth.kml+xml", width="stretch")
+
+    st.subheader("📥 Імпорт")
+    if not can:
+        st.info("Імпортувати та видаляти шари можуть «Спеціаліст з ІБ» та «Адміністратор».")
+        return
+    up = st.file_uploader("Файл GeoJSON або KML", type=["geojson", "json", "kml"], key="gis_up")
+    if up is None:
+        return
+    fc, err = parse_gis_file(up.name, up.getvalue())
+    if err:
+        st.error(f"Не вдалося прочитати файл: {err}")
+        return
+    counts, bbox = fc_stats(fc)
+    st.success(f"Прочитано {len(fc['features'])} об'єктів: " + ", ".join(f"{k} × {v}" for k, v in counts.items()))
+    if bbox:
+        st.caption(f"Охоплення: lat {bbox[0]:.3f}…{bbox[2]:.3f}, lon {bbox[1]:.3f}…{bbox[3]:.3f}")
+
+    c1, c2 = st.columns(2)
+    name = c1.text_input("Назва шару", up.name.rsplit(".", 1)[0], key="gis_name")
+    kinds = list(GIS_KINDS)
+    kind = c2.selectbox("Тип шару", kinds, index=kinds.index(detect_kind(fc)),
+                        format_func=lambda k: GIS_KINDS[k], key="gis_kind")
+    if st.button("➕ Додати як шар на карту", key="gis_add_layer"):
+        layer = {"id": datetime.now().strftime("%Y%m%d%H%M%S%f"), "name": name.strip() or up.name, "kind": kind,
+                 "source": up.name, "uploaded": datetime.now(), "visible": True, "geojson": fc}
+        ss.gis_layers.append(layer)
+        db_save_gis_layer(layer)
+        add_audit("GIS", f"Імпорт шару «{layer['name']}» ({len(fc['features'])} об'єктів, файл {up.name})")
+        ss.gis_flash = f"Шар «{layer['name']}» додано."
+        st.rerun()
+
+    if counts.get("Point"):
+        st.markdown("**Використати точки як координати вузлів телемеханіки** (збіг за назвою вузла)")
+        a1, a2, a3 = st.columns(3)
+        add_new = a1.checkbox("Додавати невідомі точки як нові вузли", key="gis_add_new")
+        parent = a2.selectbox("Канал для нових вузлів", list(ss.ot), index=list(ss.ot).index(OT_RTU_RP), key="gis_parent")
+        nkind = a3.text_input("Тип нових вузлів", "РП 10 кВ", key="gis_nkind")
+        if st.button("📍 Застосувати до вузлів", key="gis_apply_nodes"):
+            upd, add, unmatched = apply_points_to_nodes(fc, add_new, parent, nkind.strip() or "Вузол")
+            add_audit("GIS", f"Координати вузлів з «{up.name}»: оновлено {upd}, додано {add}, без збігу {len(unmatched)}")
+            msg = f"Оновлено вузлів: {upd}, додано нових: {add}."
+            if unmatched:
+                msg += f" Без збігу ({len(unmatched)}): " + ", ".join(unmatched[:10]) + ("…" if len(unmatched) > 10 else "")
+            ss.gis_flash = msg
+            st.rerun()
+    with st.expander("⚠️ Повернути демо-координати вузлів"):
+        if st.button("Скинути координати та додані вузли до демо", key="gis_reset_nodes"):
+            reset_nodes_to_demo()
+            add_audit("GIS", "Координати вузлів скинуто до демо")
+            ss.gis_flash = "Координати вузлів повернуто до демо-значень."
+            st.rerun()
+
+
+# ----------------------------------------------------------------------------
+# Розділ 14: Метеомоніторинг
+# ----------------------------------------------------------------------------
+WX_SOURCES = ["Демо-дані", "Open-Meteo (реальний прогноз)"]
+WX_SCENARIOS = ["Випадковий", "Штиль", "Гроза", "Ожеледь", "Шторм"]
+RISK_ORDER = {"Критично": 0, "Високий": 1, "Середній": 2, "Норма": 3}
+RISK_ICON = {"Критично": "🔴", "Високий": "🟠", "Середній": "🟡", "Норма": "🟢"}
+RISK_COLOR = {"Критично": "#ef4444", "Високий": "#f97316", "Середній": "#eab308", "Норма": "#22c55e"}
+
+
+def wx_text(code: int) -> str:
+    c = int(code)
+    table = {0: "Ясно", 1: "Переважно ясно", 2: "Мінлива хмарність", 3: "Хмарно", 45: "Туман", 48: "Паморозь",
+             56: "Крижана мряка", 57: "Крижана мряка", 66: "Крижаний дощ", 67: "Крижаний дощ",
+             95: "Гроза", 96: "Гроза з градом", 99: "Гроза з градом"}
+    if c in table:
+        return table[c]
+    if 51 <= c <= 55:
+        return "Мряка"
+    if 61 <= c <= 65:
+        return "Дощ"
+    if 71 <= c <= 77:
+        return "Сніг"
+    if 80 <= c <= 82:
+        return "Зливи"
+    if c in (85, 86):
+        return "Снігові зливи"
+    return "—"
+
+
+def _wx_hours() -> pd.DatetimeIndex:
+    base = datetime.now().replace(minute=0, second=0, microsecond=0)
+    return pd.date_range(base, periods=48, freq="h")
+
+
+def demo_weather_node(name: str, scenario: str) -> pd.DataFrame:
+    hours = _wx_hours()
+    n = len(hours)
+    now = datetime.now()
+    rng = np.random.default_rng(zlib.crc32(f"{name}|{scenario}|{now:%Y%m%d}|{now.hour // 6}".encode()))
+    temp = 6 + 4 * np.sin((hours.hour.to_numpy() - 9) / 24 * 2 * np.pi) + rng.normal(0, 0.3, n)
+    wind = np.clip(4 + rng.normal(0, 1, n), 0.5, None)
+    gust = wind * 1.5 + rng.uniform(0, 1.5, n)
+    precip, snow, code = np.zeros(n), np.zeros(n), np.full(n, 2)
+    sc = scenario
+    if sc == "Випадковий":
+        sc = str(rng.choice(["Штиль", "Гроза", "Ожеледь", "Шторм"], p=[.55, .17, .14, .14]))
+    elif rng.random() > 0.7:
+        sc = "Штиль"  # явний сценарій торкається ~70% вузлів
+    s = int(rng.integers(2, 14))
+    w = slice(s, min(s + int(rng.integers(4, 9)), n))
+    k = w.stop - w.start
+    if sc == "Гроза":
+        precip[w] = rng.uniform(6, 16, k)
+        gust[w] = rng.uniform(18, 27, k)
+        code[w] = 96 if rng.random() > 0.7 else 95
+    elif sc == "Ожеледь":
+        temp[w] = rng.uniform(-1.5, 0.3, k)
+        precip[w] = rng.uniform(0.5, 2.5, k)
+        wind[w] += 3
+        gust[w] = wind[w] * 1.6
+        code[w] = int(rng.choice([66, 67, 57]))
+    elif sc == "Шторм":
+        wind[w] = rng.uniform(13, 19, k)
+        gust[w] = wind[w] * 1.5
+    return pd.DataFrame({"time": hours, "temp": temp, "precip": precip, "snow": snow, "wind": wind,
+                         "gust": gust, "code": code})
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_open_meteo(coords: tuple) -> list:
+    """Прогноз Open-Meteo (без ключа). Координати округлено до 0.01° (~1 км)."""
+    q = urllib.parse.urlencode({
+        "latitude": ",".join(f"{c[0]:.2f}" for c in coords),
+        "longitude": ",".join(f"{c[1]:.2f}" for c in coords),
+        "hourly": "temperature_2m,precipitation,snowfall,wind_speed_10m,wind_gusts_10m,weather_code",
+        "wind_speed_unit": "ms", "timezone": "auto", "forecast_days": 2,
+    })
+    with urllib.request.urlopen("https://api.open-meteo.com/v1/forecast?" + q, timeout=10) as r:
+        data = json.loads(r.read())
+    if isinstance(data, dict):
+        data = [data]
+    out = []
+    for d in data:
+        h = d["hourly"]
+        out.append(pd.DataFrame({
+            "time": pd.to_datetime(h["time"]), "temp": h["temperature_2m"], "precip": h["precipitation"],
+            "snow": h["snowfall"], "wind": h["wind_speed_10m"], "gust": h["wind_gusts_10m"],
+            "code": pd.Series(h["weather_code"]).fillna(0).astype(int),
+        }))
+    return out
+
+
+def get_weather() -> tuple[dict, str, str | None]:
+    """Повертає ({вузол: DataFrame}, джерело, помилка). Реальний запит — лише за явним вибором користувача."""
+    ss = st.session_state
+    now = datetime.now()
+    err = None
+    if ss.get("wx_source", WX_SOURCES[0]) == WX_SOURCES[1]:
+        if ss.get("wx_fail_until", now) > now:
+            err = "джерело тимчасово недоступне — показано демо-дані"
+        else:
+            try:
+                coords = tuple((round(n["lat"], 2), round(n["lon"], 2)) for n in ss.nodes)
+                dfs = fetch_open_meteo(coords)
+                base = now.replace(minute=0, second=0, microsecond=0)
+                data = {n["name"]: d[d["time"] >= base].reset_index(drop=True).head(48)
+                        for n, d in zip(ss.nodes, dfs)}
+                return data, "Open-Meteo", None
+            except Exception as e:
+                ss.wx_fail_until = now + timedelta(minutes=10)
+                err = f"Open-Meteo недоступний ({str(e)[:80]}) — показано демо-дані"
+    sc = ss.get("wx_scenario", WX_SCENARIOS[0])
+    return {n["name"]: demo_weather_node(n["name"], sc) for n in ss.nodes}, "Демо", err
+
+
+def assess_weather(df: pd.DataFrame, horizon_h: int = 24) -> dict:
+    d = df.head(horizon_h).reset_index(drop=True)
+    haz = []
+
+    def first(mask) -> datetime | None:
+        idx = np.where(np.asarray(mask))[0]
+        return d["time"].iloc[int(idx[0])].to_pydatetime() if len(idx) else None
+
+    gmax = float(d["gust"].max())
+    if gmax >= 15:
+        lvl = "Критично" if gmax >= 25 else "Високий" if gmax >= 20 else "Середній"
+        haz.append({"level": lvl, "name": "Пориви вітру", "time": d["time"].iloc[int(d["gust"].argmax())].to_pydatetime(),
+                    "value": f"{gmax:.0f} м/с"})
+    t = first(d["code"].isin([56, 57, 66, 67]))
+    if t:
+        haz.append({"level": "Критично", "name": "Ожеледь (крижаний дощ/мряка)", "time": t, "value": ""})
+    wet = (d["temp"].between(-3, 1)) & ((d["precip"] > 0.2) | (d["snow"] > 0.2))
+    t = first(wet)
+    if t:
+        haz.append({"level": "Високий", "name": "Мокрий сніг / ризик ожеледі", "time": t, "value": ""})
+    t = first(d["code"].isin([96, 99]))
+    if t:
+        haz.append({"level": "Критично", "name": "Гроза з градом", "time": t, "value": ""})
+    else:
+        t = first(d["code"] == 95)
+        if t:
+            haz.append({"level": "Високий", "name": "Гроза", "time": t, "value": ""})
+    pmax = float(d["precip"].max())
+    if pmax >= 5:
+        haz.append({"level": "Високий" if pmax >= 10 else "Середній", "name": "Сильні опади",
+                    "time": d["time"].iloc[int(d["precip"].argmax())].to_pydatetime(), "value": f"{pmax:.0f} мм/год"})
+    tmin, tmax = float(d["temp"].min()), float(d["temp"].max())
+    if tmax >= 35:
+        haz.append({"level": "Середній", "name": "Спека", "time": first(d["temp"] >= 35), "value": f"{tmax:.0f} °C"})
+    if tmin <= -25:
+        haz.append({"level": "Середній", "name": "Сильний мороз", "time": first(d["temp"] <= -25), "value": f"{tmin:.0f} °C"})
+    haz.sort(key=lambda h: (RISK_ORDER[h["level"]], h["time"]))
+    return {"level": haz[0]["level"] if haz else "Норма", "hazards": haz, "gust": gmax, "tmin": tmin,
+            "precip": float(d["precip"].sum())}
+
+
+def check_weather_alerts() -> None:
+    """Раз на ~хвилину оновлює карту ризиків і створює алерти про небезпеку в найближчі 12 годин."""
+    ss = st.session_state
+    if ss.tick_n % 12:
+        return
+    data, _, _ = get_weather()
+    soon = datetime.now() + timedelta(hours=12)
+    risks = {}
+    for name, df in data.items():
+        r = assess_weather(df)
+        risks[name] = r["level"]
+        near = [h for h in r["hazards"] if h["level"] in ("Критично", "Високий") and h["time"] <= soon]
+        link = f"wx:{name}"
+        if near and name not in ss.wx_alerted:
+            h = near[0]
+            add_alert("Метеомоніторинг", h["level"],
+                      f"{name}: прогноз «{h['name']}» о {h['time']:%H:%M} {h['value']}".strip(), link=link)
+            ss.wx_alerted.add(name)
+        elif not near and name in ss.wx_alerted:
+            resolve_links(link)
+            ss.wx_alerted.discard(name)
+    ss.wx_risk = risks
+
+
+def render_weather(role: str) -> None:
+    ss = st.session_state
+    c1, c2, c3 = st.columns([2.2, 1.6, 1])
+    c1.radio("Джерело прогнозу", WX_SOURCES, key="wx_source", horizontal=True)
+    c2.selectbox("Демо-сценарій", WX_SCENARIOS, key="wx_scenario",
+                 disabled=ss.get("wx_source", WX_SOURCES[0]) != WX_SOURCES[0])
+    if c3.button("🔄 Оновити", width="stretch"):
+        fetch_open_meteo.clear()
+        ss.pop("wx_fail_until", None)
+        st.rerun()
+    st.caption("⚠️ Режим Open-Meteo надсилає координати вузлів (округлені до ≈1 км) стороннім сервісом. "
+               "Для об'єктів критичної інфраструктури узгодьте це з політикою ІБ; за замовчуванням використовуються демо-дані.")
+
+    data, label, err = get_weather()
+    if err:
+        st.warning(err)
+    risks = {n: assess_weather(df) for n, df in data.items()}
+    day = datetime.now() - timedelta(hours=24)
+    trips = {}
+    for e in ss.sw_log:
+        if e["auto"] and e["ts"] >= day:
+            trips[e["node"]] = trips.get(e["node"], 0) + 1
+
+    n_crit = sum(r["level"] == "Критично" for r in risks.values())
+    n_high = sum(r["level"] == "Високий" for r in risks.values())
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Вузлів із критичним ризиком", n_crit, delta_color="inverse", delta="потрібна увага" if n_crit else "норма")
+    k2.metric("Вузлів із високим ризиком", n_high)
+    k3.metric("Макс. пориви (24 год)", f"{max(r['gust'] for r in risks.values()):.0f} м/с")
+    k4.metric("Мін. температура (24 год)", f"{min(r['tmin'] for r in risks.values()):.0f} °C")
+    st.caption(f"Джерело: {label} · прогноз на найближчі 24 год · оновлено {datetime.now():%H:%M:%S}")
+
+    rows = []
+    for n in ss.nodes:
+        r = risks[n["name"]]
+        top = r["hazards"][0] if r["hazards"] else None
+        rows.append({
+            "Ризик": f"{RISK_ICON[r['level']]} {r['level']}", "Вузол": n["name"], "Тип": n["kind"],
+            "Небезпеки": "; ".join(f"{h['name']} {h['value']}".strip() for h in r["hazards"][:3]) or "—",
+            "Найближча": top["time"] if top else pd.NaT, "Пориви, м/с": round(r["gust"], 1),
+            "Tмін, °C": round(r["tmin"], 1), "Опади 24 год, мм": round(r["precip"], 1),
+            "Автовідключень 24 год": trips.get(n["name"], 0), "_o": RISK_ORDER[r["level"]],
+        })
+    df = pd.DataFrame(rows).sort_values(["_o", "Пориви, м/с"], ascending=[True, False]).drop(columns="_o")
+    st.dataframe(df, hide_index=True, width="stretch",
+                 column_config={"Найближча": st.column_config.DatetimeColumn(format="DD.MM HH:mm")})
+    st.caption("«Автовідключень» — спрацювання захистів за останні 24 год з журналу переключень: "
+               "допомагає зіставити погодні ризики з фактичними відключеннями.")
+
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("**Карта метеоризиків**")
+        try:
+            import folium
+            from streamlit_folium import st_folium
+
+            lats, lons = [n["lat"] for n in ss.nodes], [n["lon"] for n in ss.nodes]
+            m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True)
+            if len(ss.nodes) >= 2:
+                m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+            for n in ss.nodes:
+                r = risks[n["name"]]
+                col = RISK_COLOR[r["level"]]
+                folium.CircleMarker(
+                    location=[n["lat"], n["lon"]], radius=11 if n["kind"].startswith("ПС") else 7, color=col, weight=2,
+                    fill=True, fill_color=col, fill_opacity=0.85,
+                    tooltip=f"{n['name']} — {r['level']}",
+                    popup=folium.Popup(f"<b>{n['name']}</b><br>Ризик: {r['level']}<br>Пориви: {r['gust']:.0f} м/с<br>"
+                                       f"Tмін: {r['tmin']:.0f} °C", max_width=260),
+                ).add_to(m)
+            st_folium(m, height=400, use_container_width=True, returned_objects=[], key="wx_map")
+        except ImportError:
+            st.map(pd.DataFrame([{"lat": n["lat"], "lon": n["lon"], "color": RISK_COLOR[risks[n["name"]]["level"]]}
+                                 for n in ss.nodes]), latitude="lat", longitude="lon", color="color", size=3000)
+    with right:
+        sel = st.selectbox("Вузол для детального прогнозу", [n["name"] for n in ss.nodes], key="wx_node")
+        r = risks[sel]
+        if r["hazards"]:
+            for h in r["hazards"]:
+                st.markdown(f"{RISK_ICON[h['level']]} **{h['name']}** — {h['time']:%d.%m %H:%M} {h['value']}")
+        else:
+            st.success("Небезпечних явищ на найближчі 24 год не прогнозується.")
+        cur = data[sel].iloc[0]
+        st.caption(f"Зараз: {cur['temp']:.0f} °C · вітер {cur['wind']:.0f} м/с (пориви {cur['gust']:.0f}) · {wx_text(cur['code'])}")
+
+    d = data[sel]
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(x=d["time"], y=d["precip"], name="Опади, мм/год", opacity=0.35), secondary_y=False)
+    fig.add_trace(go.Scatter(x=d["time"], y=d["wind"], name="Вітер, м/с", mode="lines"), secondary_y=False)
+    fig.add_trace(go.Scatter(x=d["time"], y=d["gust"], name="Пориви, м/с", mode="lines", line=dict(dash="dash")),
+                  secondary_y=False)
+    fig.add_trace(go.Scatter(x=d["time"], y=d["temp"], name="Температура, °C", mode="lines",
+                             line=dict(color="#ef4444")), secondary_y=True)
+    fig.add_hline(y=20, line_dash="dot", line_color="#ef4444", opacity=0.5)
+    fig.update_yaxes(title_text="м/с · мм/год", secondary_y=False)
+    fig.update_yaxes(title_text="°C", secondary_y=True)
+    fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.12),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, width="stretch", key="wx_chart")
+    st.caption("Пунктирна червона лінія — 20 м/с (поріг «високого» ризику за поривами). "
+               "Пороги в assess_weather() варто узгодити з нормативами ваших ліній (типи опор, ожеледне навантаження).")
 
 
 # ----------------------------------------------------------------------------
@@ -1589,6 +2626,8 @@ def tick_all() -> None:
     tick_ot()
     tick_gateways()
     check_disk_forecasts()  # прогноз заповнення дисків (розділ 11)
+    check_weather_alerts()  # метеоризики (розділ 14)
+    tick_switching()  # імітація спрацювання захистів (розділ 12)
     process_new_alerts()  # автоінциденти та сповіщення (розділи 6 та 9)
 
 
@@ -1632,7 +2671,7 @@ def node_effective_status(node: dict) -> str:
     return node["status"]
 
 
-def render_ot_map() -> None:
+def render_ot_map(height: int = 430, key: str = "ot_map") -> None:
     ss = st.session_state
     pts = []
     for n in ss.nodes:
@@ -1644,10 +2683,28 @@ def render_ot_map() -> None:
         from streamlit_folium import st_folium
     except ImportError:
         st.map(pd.DataFrame(pts), latitude="lat", longitude="lon", color="color", size=3000)
-        st.caption("Для інтерактивної карти встановіть: pip install folium streamlit-folium")
+        st.caption("Для інтерактивної карти та шарів GIS встановіть: pip install folium streamlit-folium")
         return
 
-    m = folium.Map(location=[49.05, 28.55], zoom_start=8, control_scale=True)
+    lats, lons = [p["lat"] for p in pts], [p["lon"] for p in pts]
+    m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True)
+    if len(pts) >= 2:
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+
+    layers = [L for L in ss.get("gis_layers", []) if L.get("visible", True)]
+    for L in layers:  # імпортовані шари GeoJSON/KML
+        color = GIS_COLOR.get(L["kind"], "#2563eb")
+        try:
+            folium.GeoJson(
+                L["geojson"],
+                name=L["name"],
+                style_function=lambda _f, c=color: {"color": c, "weight": 3, "fillColor": c, "fillOpacity": 0.12},
+                marker=folium.CircleMarker(radius=4, color=color, fill=True, fill_opacity=0.8),
+                tooltip=folium.GeoJsonTooltip(fields=["name"], labels=False),
+            ).add_to(m)
+        except Exception:
+            pass
+
     for p in pts:
         folium.CircleMarker(
             location=[p["lat"], p["lon"]],
@@ -1663,7 +2720,9 @@ def render_ot_map() -> None:
                 max_width=280,
             ),
         ).add_to(m)
-    st_folium(m, height=430, use_container_width=True, returned_objects=[], key="ot_map")
+    if layers:
+        folium.LayerControl(collapsed=True).add_to(m)
+    st_folium(m, height=height, use_container_width=True, returned_objects=[], key=key)
 
 
 def alert_action(kind: str, role: str, ids: set | None = None, only_ack: bool = False) -> int:
@@ -2572,7 +3631,7 @@ def main() -> None:
     st.divider()
 
     (tab_sec, tab_infra, tab_ot, tab_api, tab_docs,
-     tab_inc, tab_assets, tab_rep, tab_notif) = st.tabs(
+     tab_inc, tab_assets, tab_rep, tab_notif, tab_sw, tab_gis, tab_wx) = st.tabs(
         [
             "🔐 Кібербезпека та доступ",
             "🖥️ Інфраструктура",
@@ -2583,6 +3642,9 @@ def main() -> None:
             "🧩 Активи",
             "📈 Звіти та SLA",
             "🔔 Сповіщення",
+            "🔀 Журнал переключень",
+            "🗺️ GIS: схеми мереж",
+            "🌦️ Метеомоніторинг",
         ]
     )
 
@@ -2629,6 +3691,15 @@ def main() -> None:
 
     with tab_notif:
         render_notifications(role)
+
+    with tab_sw:
+        render_switching(role)
+
+    with tab_gis:
+        render_gis(role)
+
+    with tab_wx:
+        render_weather(role)
 
 
 if __name__ == "__main__":
