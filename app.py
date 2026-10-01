@@ -9,9 +9,17 @@
   7. Активи та відповідність (патчі, сертифікати, вразливості, ризик-скор)
   8. Звіти та SLA (Excel-звіт, оперативне зведення)
   9. Сповіщення (Telegram, dry-run за замовчуванням)
+  10. Збереження стану: інциденти, документи, журнал дій, метрики -> SQLite / PostgreSQL
+  11. Прогноз заповнення дисків (лінійний тренд) та виявлення аномалій (z-score)
 
 Запуск:
-    pip install streamlit pandas numpy plotly openpyxl folium streamlit-folium
+    pip install streamlit pandas numpy plotly openpyxl sqlalchemy folium streamlit-folium
+    # для PostgreSQL додатково: pip install psycopg2-binary
+
+База даних:
+    за замовчуванням — SQLite-файл ops_center.db поруч зі скриптом;
+    для PostgreSQL задайте DATABASE_URL (змінна середовища або .streamlit/secrets.toml), напр.:
+    postgresql://user:password@host:5432/opscenter
     streamlit run security_ops_dashboard.py
 
 Дані у цій версії СИМУЛЬОВАНІ (генеруються в реальному часі).
@@ -22,6 +30,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -35,6 +44,16 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+try:
+    from sqlalchemy import (
+        Column, DateTime, Float, Integer, LargeBinary, MetaData, String, Table, Text,
+        create_engine, delete, func, insert, select, update,
+    )
+
+    HAS_DB = True
+except ImportError:  # SQLAlchemy не встановлено — працюємо лише в пам'яті
+    HAS_DB = False
 
 # ----------------------------------------------------------------------------
 # Налаштування сторінки
@@ -97,6 +116,8 @@ STATUS_ICON = {STATUS_OK: "🟢", STATUS_WARN: "🟡", STATUS_DOWN: "🔴"}
 
 MAX_LOG_ROWS = 3000
 MAX_HISTORY = 90
+MAX_FC_HISTORY = 360  # довша історія для прогнозу та аномалій
+DB_URL_DEFAULT = "sqlite:///ops_center.db"
 
 STATUS_OFF = "Вимкнено"
 STATUS_COLOR[STATUS_OFF] = "#9ca3af"
@@ -155,7 +176,7 @@ ALERT_TEMPLATES = [
     ("Наряди-допуски", "Високий", "Помилка формування наряду-допуску (БД недоступна)"),
 ]
 ALERT_SOURCES = sorted(
-    {t[0] for t in ALERT_TEMPLATES} | {i[1] for i in OT_INTEGRATIONS} | {"API-шлюз"}
+    {t[0] for t in ALERT_TEMPLATES} | {i[1] for i in OT_INTEGRATIONS} | {"API-шлюз", "Інфраструктура"}
 )
 
 # --- Розділ 4: API-шлюзи (назва, ендпоінт, протокол, базовий RPS, ліміт RPS, базова затримка мс)
@@ -219,6 +240,13 @@ PLAYBOOKS = {
         "Перезапустити службу застосунку",
         "Перевірити синхронізацію нарядів-допусків",
     ],
+    "Заповнення диска / ємність": [
+        "Визначити, що саме швидко росте (логи, БД, тимчасові файли)",
+        "Очистити/архівувати логи та тимчасові дані",
+        "Перевірити, що резервні копії не накопичуються локально",
+        "Розширити том або перенести дані на додаткове сховище",
+        "Налаштувати ротацію логів / квоти, щоб запобігти повторенню",
+    ],
     "Загальний інцидент": [
         "Оцінити вплив і залучити відповідальних",
         "Локалізувати проблему",
@@ -277,6 +305,8 @@ def init_state() -> None:
     ss.rng = rng
     ss.attack_ticks = 0
     ss.attacker = None
+    ss.tick_n = 0
+    ss.fc_alerted = set()
 
     # --- Сервіси
     ss.services = {
@@ -304,6 +334,7 @@ def init_state() -> None:
             "ram": float(rng.uniform(40, 70)),
             "disk": float(rng.uniform(45, 80)),
             "net": float(rng.uniform(50, 400)),
+            "disk_rate": float(rng.uniform(0.5, 6.0)),  # демо-швидкість росту диска, %/год
         }
         for s in SERVERS
     }
@@ -312,6 +343,9 @@ def init_state() -> None:
     )
     ss.ram_hist = pd.DataFrame(
         {s: [ss.servers[s]["ram"]] for s in SERVERS}, index=[now]
+    )
+    ss.disk_hist = pd.DataFrame(
+        {s: [ss.servers[s]["disk"]] for s in SERVERS}, index=[now]
     )
 
     # --- Бекапи
@@ -332,6 +366,7 @@ def init_state() -> None:
 
     init_extra_state()
     init_ext_state()
+    load_persistent_state()  # відновлення збереженого стану з БД
     ss.initialized = True
 
 
@@ -387,17 +422,30 @@ def tick_servers() -> None:
     ss = st.session_state
     rng = ss.rng
     now = datetime.now()
+    dt = min((now - ss.get("last_tick", now)).total_seconds(), 120.0)
+    ss.last_tick = now
     for name, m in ss.servers.items():
         m["cpu"] = float(np.clip(m["cpu"] + rng.normal(0, 6) + (rng.random() < 0.03) * 30, 3, 100))
         m["cpu"] = m["cpu"] * 0.93 + 35 * 0.07  # повернення до середнього
         m["ram"] = float(np.clip(m["ram"] + rng.normal(0, 1.5), 15, 99))
-        m["disk"] = float(np.clip(m["disk"] + abs(rng.normal(0.02, 0.05)), 10, 99))
+        step = m.get("disk_rate", 2.0) * dt / 3600  # ріст прив'язаний до реального часу, %
+        m["disk"] += abs(float(rng.normal(step, step * 0.5)))
+        if m["disk"] >= 97:  # імітація очищення диска адміністратором
+            m["disk"] -= float(rng.uniform(15, 30))
+        m["disk"] = float(np.clip(m["disk"], 10, 99))
         m["net"] = float(np.clip(m["net"] + rng.normal(0, 40), 5, 1000))
 
     ss.cpu_hist.loc[now] = [ss.servers[s]["cpu"] for s in SERVERS]
     ss.ram_hist.loc[now] = [ss.servers[s]["ram"] for s in SERVERS]
-    ss.cpu_hist = ss.cpu_hist.tail(MAX_HISTORY)
-    ss.ram_hist = ss.ram_hist.tail(MAX_HISTORY)
+    ss.disk_hist.loc[now] = [ss.servers[s]["disk"] for s in SERVERS]
+    ss.cpu_hist = ss.cpu_hist.tail(MAX_FC_HISTORY)
+    ss.ram_hist = ss.ram_hist.tail(MAX_FC_HISTORY)
+    ss.disk_hist = ss.disk_hist.tail(MAX_FC_HISTORY)
+
+    ss.tick_n += 1
+    db_save_metrics(now, ss.servers)
+    if ss.tick_n % 500 == 0:
+        db_prune_metrics()
 
 
 def get_backups() -> pd.DataFrame:
@@ -762,8 +810,8 @@ def render_infrastructure() -> None:
     # Графіки історії
     c1, c2 = st.columns(2)
     for col, hist, title, key in [
-        (c1, ss.cpu_hist, "Навантаження CPU, %", "cpu_chart"),
-        (c2, ss.ram_hist, "Використання RAM, %", "ram_chart"),
+        (c1, ss.cpu_hist.tail(MAX_HISTORY), "Навантаження CPU, %", "cpu_chart"),
+        (c2, ss.ram_hist.tail(MAX_HISTORY), "Використання RAM, %", "ram_chart"),
     ]:
         with col:
             st.subheader(title)
@@ -800,21 +848,467 @@ def render_infrastructure() -> None:
         },
     )
 
+    render_forecast()
+
+
+# ----------------------------------------------------------------------------
+# Збереження стану (SQLite за замовчуванням, PostgreSQL через DATABASE_URL)
+# ----------------------------------------------------------------------------
+if HAS_DB:
+    _meta = MetaData()
+    t_audit = Table(
+        "audit", _meta,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("ts", DateTime, index=True),
+        Column("role", String(64)),
+        Column("action", String(64)),
+        Column("detail", Text),
+    )
+    t_inc = Table(
+        "incidents", _meta,
+        Column("id", String(16), primary_key=True),
+        Column("status", String(32)),
+        Column("severity", String(16)),
+        Column("created", DateTime),
+        Column("payload", Text),  # повний інцидент у JSON (кроки плейбука, таймлайн)
+    )
+    t_doc = Table(
+        "documents", _meta,
+        Column("id", String(16), primary_key=True),
+        Column("title", Text),
+        Column("category", String(64)),
+        Column("level", Integer),
+        Column("version", String(32)),
+        Column("owner", String(128)),
+        Column("updated", DateTime),
+        Column("filename", String(255)),
+        Column("size", Integer),
+        Column("sha", String(64)),
+        Column("history", Text),
+        Column("content", LargeBinary),
+    )
+    t_met = Table(
+        "metrics", _meta,
+        Column("id", Integer, primary_key=True, autoincrement=True),
+        Column("ts", DateTime, index=True),
+        Column("server", String(64), index=True),
+        Column("cpu", Float),
+        Column("ram", Float),
+        Column("disk", Float),
+    )
+
+
+def _json_default(o):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    return str(o)
+
+
+def _dt(v):
+    return datetime.fromisoformat(v) if isinstance(v, str) else v
+
+
+def db_safe(default=None):
+    """Помилки БД не повинні ламати дашборд: фіксуємо їх і працюємо далі в пам'яті."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(*args, **kwargs):
+            if not HAS_DB:
+                return default
+            try:
+                result = fn(*args, **kwargs)
+                st.session_state.pop("db_error", None)
+                return result
+            except Exception as e:
+                st.session_state["db_error"] = str(e)[:200]
+                return default
+
+        return wrap
+
+    return deco
+
+
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    url = _secret("DATABASE_URL") or DB_URL_DEFAULT
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    kwargs = {"pool_pre_ping": True}
+    if url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False}
+    engine = create_engine(url, **kwargs)
+    _meta.create_all(engine)
+    return engine
+
+
+def db_status() -> tuple[bool, str]:
+    if not HAS_DB:
+        return False, "SQLAlchemy не встановлено — дані лише в пам'яті (pip install sqlalchemy)"
+    err = st.session_state.get("db_error")
+    if err:
+        return False, f"Помилка БД: {err}"
+    try:
+        return True, get_engine().dialect.name
+    except Exception as e:
+        return False, f"БД недоступна: {str(e)[:150]}"
+
+
+def _upsert(conn, table, key: str, values: dict) -> None:
+    res = conn.execute(update(table).where(table.c[key] == values[key]).values(**values))
+    if res.rowcount == 0:
+        conn.execute(insert(table).values(**values))
+
+
+# --- журнал дій
+@db_safe()
+def db_add_audit(entry: dict) -> None:
+    with get_engine().begin() as c:
+        c.execute(insert(t_audit).values(
+            ts=entry["Час"], role=str(entry["Роль"]), action=entry["Дія"], detail=entry["Деталі"]))
+
+
+@db_safe(None)
+def db_load_audit(limit: int = 500):
+    with get_engine().connect() as c:
+        rows = c.execute(
+            select(t_audit.c.ts, t_audit.c.role, t_audit.c.action, t_audit.c.detail)
+            .order_by(t_audit.c.id.desc()).limit(limit)
+        ).fetchall()
+    return [{"Час": r[0], "Роль": r[1], "Дія": r[2], "Деталі": r[3]} for r in reversed(rows)]
+
+
+# --- інциденти
+@db_safe()
+def db_save_incident(inc: dict) -> None:
+    vals = dict(
+        id=inc["id"], status=inc["status"], severity=inc["severity"], created=inc["created"],
+        payload=json.dumps(inc, ensure_ascii=False, default=_json_default),
+    )
+    with get_engine().begin() as c:
+        _upsert(c, t_inc, "id", vals)
+
+
+@db_safe(None)
+def db_load_incidents():
+    with get_engine().connect() as c:
+        rows = c.execute(select(t_inc.c.payload).order_by(t_inc.c.created)).fetchall()
+    out = []
+    for (payload,) in rows:
+        d = json.loads(payload)
+        for k in ("created", "acked", "closed"):
+            d[k] = _dt(d.get(k))
+        d["timeline"] = [(_dt(t), w, x) for t, w, x in d["timeline"]]
+        d["alert_id"] = None  # ID сповіщень не зберігаються між запусками — зв'язок скидаємо
+        out.append(d)
+    return out
+
+
+# --- документи (разом із вмістом файлів)
+@db_safe()
+def db_save_doc(d: dict) -> None:
+    vals = dict(
+        id=d["id"], title=d["title"], category=d["category"], level=d["level"], version=d["version"],
+        owner=d["owner"], updated=d["updated"], filename=d["filename"], size=d["size"], sha=d["sha"],
+        history=json.dumps(d["history"], ensure_ascii=False, default=_json_default),
+        content=d["content"],
+    )
+    with get_engine().begin() as c:
+        _upsert(c, t_doc, "id", vals)
+
+
+@db_safe(None)
+def db_count_docs():
+    with get_engine().connect() as c:
+        return int(c.execute(select(func.count()).select_from(t_doc)).scalar())
+
+
+@db_safe(None)
+def db_load_docs():
+    with get_engine().connect() as c:
+        rows = c.execute(select(t_doc).order_by(t_doc.c.id)).mappings().all()
+    docs = []
+    for r in rows:
+        hist = json.loads(r["history"] or "[]")
+        for h in hist:
+            h["Оновлено"] = _dt(h.get("Оновлено"))
+        docs.append({
+            "id": r["id"], "title": r["title"], "category": r["category"], "level": r["level"],
+            "version": r["version"], "owner": r["owner"], "updated": r["updated"],
+            "content": bytes(r["content"]), "filename": r["filename"], "size": r["size"],
+            "sha": r["sha"], "history": hist,
+        })
+    return docs
+
+
+# --- метрики серверів (для прогнозу, щоб історія переживала перезапуск)
+@db_safe()
+def db_save_metrics(ts: datetime, servers: dict) -> None:
+    rows = [dict(ts=ts, server=n, cpu=float(m["cpu"]), ram=float(m["ram"]), disk=float(m["disk"]))
+            for n, m in servers.items()]
+    with get_engine().begin() as c:
+        c.execute(insert(t_met), rows)
+
+
+@db_safe()
+def db_prune_metrics(days: int = 14) -> None:
+    with get_engine().begin() as c:
+        c.execute(delete(t_met).where(t_met.c.ts < datetime.now() - timedelta(days=days)))
+
+
+@db_safe(None)
+def db_load_metrics(n_rows: int):
+    with get_engine().connect() as c:
+        rows = c.execute(
+            select(t_met.c.ts, t_met.c.server, t_met.c.cpu, t_met.c.ram, t_met.c.disk)
+            .order_by(t_met.c.ts.desc()).limit(n_rows)
+        ).fetchall()
+    return pd.DataFrame([tuple(r) for r in rows], columns=["ts", "server", "cpu", "ram", "disk"])
+
+
+@db_safe()
+def db_clear_all() -> None:
+    with get_engine().begin() as c:
+        for t in (t_audit, t_inc, t_doc, t_met):
+            c.execute(delete(t))
+
+
+def load_persistent_state() -> None:
+    """Підвантажує збережений стан після (пере)запуску. Порожня БД заповнюється початковими даними."""
+    ss = st.session_state
+    if not HAS_DB:
+        return
+    n_docs = db_count_docs()
+    if n_docs is None:  # БД недоступна — працюємо в пам'яті
+        return
+
+    if n_docs == 0:
+        for d in ss.docs:
+            db_save_doc(d)
+    else:
+        docs = db_load_docs()
+        if docs:
+            ss.docs = docs
+            ss.doc_seq = max(int(d["id"].split("-")[1]) for d in docs)
+
+    incs = db_load_incidents()
+    if incs:
+        ss.incidents = incs
+        ss.inc_seq = max(int(i["id"].split("-")[1]) for i in incs)
+
+    audit = db_load_audit()
+    if audit:
+        ss.audit = audit
+
+    m = db_load_metrics(MAX_FC_HISTORY * len(SERVERS))
+    if m is not None and not m.empty:
+        m["ts"] = pd.to_datetime(m["ts"])
+        last = m.sort_values("ts").groupby("server").tail(1)
+        for _, r in last.iterrows():
+            if r["server"] in ss.servers:
+                ss.servers[r["server"]].update(cpu=float(r["cpu"]), ram=float(r["ram"]), disk=float(r["disk"]))
+
+        def piv(col: str) -> pd.DataFrame:
+            p = m.pivot_table(index="ts", columns="server", values=col, aggfunc="mean").sort_index()
+            p = p.reindex(columns=SERVERS)
+            p.index.name, p.columns.name = None, None  # reset_index() у графіках очікує колонку "index"
+            return p
+
+        if m["ts"].nunique() >= 2:
+            ss.cpu_hist = piv("cpu").tail(MAX_FC_HISTORY)
+            ss.ram_hist = piv("ram").tail(MAX_FC_HISTORY)
+            ss.disk_hist = piv("disk").tail(MAX_FC_HISTORY)
+
+
+# ----------------------------------------------------------------------------
+# Розділ 11: Прогноз заповнення дисків та виявлення аномалій
+# ----------------------------------------------------------------------------
+def fmt_eta(td: timedelta | None) -> str:
+    if td is None:
+        return "не заповниться (тренд ≤ 0)"
+    h = td.total_seconds() / 3600
+    if h < 1:
+        return f"{int(h * 60)} хв"
+    if h < 48:
+        return f"{h:.1f} год"
+    if h < 365 * 24:
+        return f"{h / 24:.1f} дн"
+    return "> 1 року"
+
+
+def forecast_disk(series: pd.Series, window: int = 120, min_points: int = 15) -> dict | None:
+    """Лінійний тренд заповнення диска. Враховує лише дані після останнього «очищення»."""
+    s = series.dropna().tail(window)
+    if len(s) >= 3:
+        drops = np.where((s.diff() < -5).to_numpy())[0]
+        if len(drops):
+            s = s.iloc[drops[-1]:]
+    if len(s) < min_points:
+        return None
+    x = np.asarray((s.index - s.index[0]).total_seconds(), dtype=float)
+    y = s.to_numpy(dtype=float)
+    if x[-1] <= 0:
+        return None
+    slope, icpt = np.polyfit(x, y, 1)  # % за секунду
+    fit = slope * x + icpt
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1 - float(((y - fit) ** 2).sum()) / ss_tot if ss_tot > 0 else 0.0
+    cur = float(y[-1])
+    eta = timedelta(seconds=max((100 - cur) / slope, 0.0)) if slope > 1e-7 else None
+    return {"cur": cur, "slope": float(slope), "slope_h": float(slope) * 3600, "r2": r2, "eta": eta, "n": len(s)}
+
+
+def detect_anomalies(z_thr: float, recent_n: int = 10, base_n: int = 60) -> pd.DataFrame:
+    """z-score: порівнюємо останні точки з базовим рівнем попередніх. Для диска аналізуємо приріст."""
+    ss = st.session_state
+    specs = [
+        ("CPU, %", ss.cpu_hist, False, 0.5),
+        ("RAM, %", ss.ram_hist, False, 0.5),
+        ("Диск, приріст %/тік", ss.disk_hist, True, 0.002),
+    ]
+    rows = []
+    for label, hist, use_diff, sd_floor in specs:
+        for srv in SERVERS:
+            if srv not in hist.columns:
+                continue
+            ser = hist[srv].dropna()
+            if use_diff:
+                ser = ser.diff().dropna()
+            recent, base = ser.iloc[-recent_n:], ser.iloc[-(base_n + recent_n):-recent_n]
+            if len(base) < 15 or len(recent) < 3:
+                continue
+            mu, sd = float(base.mean()), max(float(base.std(ddof=0)), sd_floor)
+            z = (recent - mu) / sd
+            i = int(np.argmax(np.abs(z.to_numpy())))
+            zi = float(z.iloc[i])
+            rows.append({
+                "Статус": "🔴 Аномалія" if abs(zi) >= z_thr else "🟢 Норма",
+                "Сервер": srv,
+                "Метрика": label,
+                "Значення": round(float(recent.iloc[i]), 3),
+                "Базовий рівень": round(mu, 3),
+                "σ": round(sd, 3),
+                "z": round(zi, 1),
+                "|z|": round(abs(zi), 1),
+            })
+    df = pd.DataFrame(rows, columns=["Статус", "Сервер", "Метрика", "Значення", "Базовий рівень", "σ", "z", "|z|"])
+    return df.sort_values("|z|", ascending=False) if not df.empty else df
+
+
+def check_disk_forecasts() -> None:
+    """Створює сповіщення, коли диск, за прогнозом, заповниться швидше за заданий поріг."""
+    ss = st.session_state
+    if ss.tick_n % 6:
+        return
+    warn_h = ss.get("fc_warn_h", 24)
+    for srv in SERVERS:
+        fc = forecast_disk(ss.disk_hist[srv])
+        eta_h = fc["eta"].total_seconds() / 3600 if fc and fc["eta"] is not None else None
+        link = f"disk:{srv}"
+        if eta_h is not None and eta_h <= warn_h:
+            if srv not in ss.fc_alerted:
+                sev = "Критично" if eta_h <= warn_h / 6 else "Високий"
+                add_alert("Інфраструктура", sev,
+                          f"Диск {srv} заповниться приблизно через {fmt_eta(fc['eta'])} (зараз {fc['cur']:.0f}%)",
+                          link=link)
+                ss.fc_alerted.add(srv)
+        elif srv in ss.fc_alerted and (eta_h is None or eta_h > warn_h * 1.5):
+            resolve_links(link)
+            ss.fc_alerted.discard(srv)
+
+
+def render_forecast() -> None:
+    ss = st.session_state
+    warn_h = ss.get("fc_warn_h", 24)
+    z_thr = ss.get("z_thr", 3.0)
+    now = datetime.now()
+
+    st.divider()
+    st.subheader("🔮 Прогноз заповнення дисків")
+    rows, fcs = [], {}
+    for srv in SERVERS:
+        fc = forecast_disk(ss.disk_hist[srv])
+        fcs[srv] = fc
+        cur = round(ss.servers[srv]["disk"], 1)
+        if fc is None:
+            rows.append({"Ризик": "⚪ Недостатньо даних", "Сервер": srv, "Диск, %": cur, "Тренд, %/год": None,
+                         "R²": None, "Заповниться через": "—", "Орієнтовна дата": pd.NaT})
+            continue
+        eta_h = fc["eta"].total_seconds() / 3600 if fc["eta"] is not None else None
+        risk = ("🟢 Стабільно" if eta_h is None else "🔴 Критично" if eta_h <= warn_h / 6
+                else "🟠 Увага" if eta_h <= warn_h else "🟢 Норма")
+        when = now + fc["eta"] if fc["eta"] is not None and eta_h < 365 * 24 else pd.NaT
+        rows.append({"Ризик": risk, "Сервер": srv, "Диск, %": cur, "Тренд, %/год": round(fc["slope_h"], 2),
+                     "R²": round(fc["r2"], 2), "Заповниться через": fmt_eta(fc["eta"]), "Орієнтовна дата": when})
+    df = pd.DataFrame(rows)
+
+    at_risk = int(df["Ризик"].str.contains("Критично|Увага").sum())
+    etas = [f["eta"] for f in fcs.values() if f and f["eta"] is not None]
+    an = detect_anomalies(z_thr)
+    n_anom = int((an["Статус"] == "🔴 Аномалія").sum()) if not an.empty else 0
+    k1, k2, k3 = st.columns(3)
+    k1.metric(f"Дисків під ризиком (< {warn_h} год)", at_risk, delta_color="inverse",
+              delta="потрібна увага" if at_risk else "норма")
+    k2.metric("Найближче заповнення", fmt_eta(min(etas)) if etas else "—")
+    k3.metric("Активних аномалій", n_anom, delta_color="inverse", delta="перевірте" if n_anom else "норма")
+
+    st.dataframe(
+        df, hide_index=True, width="stretch",
+        column_config={
+            "Диск, %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+            "Орієнтовна дата": st.column_config.DatetimeColumn(format="DD.MM.YYYY HH:mm"),
+        },
+    )
+    st.caption("Прогноз — лінійна регресія по останніх вимірах (після останнього очищення диска). "
+               "R² показує, наскільки тренд близький до прямої: при малому R² прогноз ненадійний.")
+
+    sel = st.selectbox("Сервер для графіка", SERVERS, key="fc_srv")
+    hist = ss.disk_hist[sel].dropna()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=hist.index, y=hist.values, mode="lines", name="Факт"))
+    fc = fcs[sel]
+    if fc and fc["eta"] is not None and len(hist):
+        horizon = min(fc["eta"], timedelta(days=30))
+        end_y = min(fc["cur"] + fc["slope"] * horizon.total_seconds(), 100.0)
+        fig.add_trace(go.Scatter(x=[hist.index[-1], hist.index[-1] + horizon], y=[fc["cur"], end_y],
+                                 mode="lines", name="Прогноз", line=dict(dash="dash", color="#f59e0b")))
+    fig.add_hline(y=100, line_dash="dot", line_color="#ef4444", opacity=0.7)
+    fig.add_hline(y=90, line_dash="dot", line_color="#f59e0b", opacity=0.5)
+    lo = float(hist.min()) - 5 if len(hist) else 0
+    fig.update_yaxes(range=[max(0, lo), 105], title="%")
+    fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.1),
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    st.plotly_chart(fig, width="stretch", key="disk_forecast_chart")
+
+    st.subheader("🧪 Виявлення аномалій (z-score)")
+    if an.empty:
+        st.info("Накопичується історія для аналізу (потрібно ≈ 25 вимірів).")
+    else:
+        st.dataframe(
+            an, hide_index=True, width="stretch", height=min(420, 60 + 35 * len(an)),
+            column_config={"|z|": st.column_config.ProgressColumn(
+                min_value=0, max_value=float(max(z_thr * 2, an["|z|"].max())), format="%.1f")},
+        )
+    st.caption(f"Останні 10 вимірів порівнюються з базовим рівнем попередніх точок; "
+               f"|z| ≥ {z_thr} вважається аномалією. Для диска аналізується приріст між вимірами.")
+
 
 # ----------------------------------------------------------------------------
 # Спільні допоміжні функції (журнал дій, сповіщення)
 # ----------------------------------------------------------------------------
 def add_audit(action: str, detail: str) -> None:
     ss = st.session_state
-    ss.audit.append(
-        {
-            "Час": datetime.now(),
-            "Роль": ss.get("role_sel", "—"),
-            "Дія": action,
-            "Деталі": detail,
-        }
-    )
+    entry = {
+        "Час": datetime.now(),
+        "Роль": ss.get("role_sel", "—"),
+        "Дія": action,
+        "Деталі": detail,
+    }
+    ss.audit.append(entry)
     ss.audit = ss.audit[-500:]
+    db_add_audit(entry)
 
 
 def add_alert(source: str, severity: str, message: str, link: str | None = None) -> None:
@@ -1094,6 +1588,7 @@ def tick_all() -> None:
     tick_servers()
     tick_ot()
     tick_gateways()
+    check_disk_forecasts()  # прогноз заповнення дисків (розділ 11)
     process_new_alerts()  # автоінциденти та сповіщення (розділи 6 та 9)
 
 
@@ -1472,6 +1967,7 @@ def render_docs(role: str) -> None:
                         doc = make_doc(ss.doc_seq, title.strip(), cat, lvl, ver.strip() or "1.0",
                                        role, datetime.now(), data, _safe_name(up.name))
                         ss.docs.append(doc)
+                        db_save_doc(doc)
                         add_audit("Документ", f"Додано {doc['id']} «{doc['title']}» ({LEVELS[lvl]})")
                         st.success(f"Документ {doc['id']} додано до реєстру.")
 
@@ -1519,6 +2015,7 @@ def render_docs(role: str) -> None:
                         )
                         if new_lvl is not None:
                             d["level"] = new_lvl
+                        db_save_doc(d)
                         add_audit("Документ", f"Оновлено {d['id']} до v{d['version']}. {note}".strip())
                         st.success(f"{d['id']} оновлено до версії {d['version']}.")
 
@@ -1609,6 +2106,8 @@ def render_docs(role: str) -> None:
 # ----------------------------------------------------------------------------
 def pick_playbook(source: str, message: str) -> str:
     text = f"{source} {message}".lower()
+    if "диск" in text or "заповн" in text:
+        return "Заповнення диска / ємність"
     if "brute" in text or "злам" in text or "авториз" in text:
         return "Brute-force / компрометація облікового запису"
     if "scada" in text or "rtu" in text or "телемех" in text or ("оік" in text and "зв'язок" in text):
@@ -1645,6 +2144,7 @@ def create_incident(title: str, severity: str, alert_id: int | None = None,
         "timeline": [(datetime.now(), who, f"Інцидент створено ({severity})")],
     }
     ss.incidents.append(inc)
+    db_save_incident(inc)
     add_audit("Інцидент", f"Створено {inc['id']}: {title}")
     return inc
 
@@ -1664,6 +2164,7 @@ def _set_status(inc: dict, new: str, who: str) -> None:
         inc["closed"] = None
     inc["timeline"].append((now, who, f"Статус: {inc['status']} → {new}"))
     inc["status"] = new
+    db_save_incident(inc)
     add_audit("Інцидент", f"{inc['id']}: статус {new}")
 
 
@@ -1745,11 +2246,13 @@ def render_incidents(role: str) -> None:
             if val != inc["steps"][step]:
                 inc["steps"][step] = val
                 inc["timeline"].append((datetime.now(), role, f"{'Виконано' if val else 'Знято'}: {step}"))
+                db_save_incident(inc)
         if can:
             with st.form(f"comment_{inc['id']}", clear_on_submit=True):
                 text = st.text_input("Коментар")
                 if st.form_submit_button("Додати коментар") and text.strip():
                     inc["timeline"].append((datetime.now(), role, text.strip()))
+                    db_save_incident(inc)
                     st.rerun()
     with right:
         if can:
@@ -1761,6 +2264,7 @@ def render_incidents(role: str) -> None:
                     inc["timeline"].append((datetime.now(), role, f"Відповідальний: {assignee or '—'}"))
                     inc["assignee"] = assignee
                 _set_status(inc, new_status, role)
+                db_save_incident(inc)
                 st.rerun()
         else:
             st.info("Режим перегляду: змінювати інциденти можуть диспетчери, ІБ та адміністратори.")
@@ -2019,9 +2523,26 @@ def main() -> None:
                  "перевищує поріг — генерується сповіщення.",
         )
         st.divider()
+        st.subheader("🔮 Прогноз та аномалії")
+        st.slider("Попереджати, якщо диск заповниться швидше ніж, год", 1, 168, 24, key="fc_warn_h")
+        st.slider("Поріг аномалії (|z|)", 2.0, 6.0, 3.0, 0.5, key="z_thr",
+                  help="Скільки стандартних відхилень від базового рівня вважати аномалією.")
+        st.divider()
         st.subheader("👤 Доступ (демо)")
         role = st.selectbox("Роль користувача", list(ROLES), index=3, key="role_sel")
         st.caption(f"Допуск: {LEVEL_ICON[ROLES[role]['clear']]} {LEVELS[ROLES[role]['clear']]}")
+        st.divider()
+        st.subheader("🗄️ Сховище даних")
+        db_ok, db_info = db_status()
+        st.caption(f"✅ Збереження увімкнено: {db_info}" if db_ok else f"⚠️ {db_info}")
+        if role == "Адміністратор" and db_ok:
+            with st.expander("Небезпечна зона"):
+                wipe_ok = st.checkbox("Підтверджую повне очищення БД", key="db_wipe_ok")
+                if st.button("Очистити БД і скинути", disabled=not wipe_ok, width="stretch"):
+                    db_clear_all()
+                    for k in list(st.session_state.keys()):
+                        del st.session_state[k]
+                    st.rerun()
         st.divider()
         st.subheader("🧪 Демонстрація")
         if st.button("Симулювати brute-force атаку", width="stretch"):
