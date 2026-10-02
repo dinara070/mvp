@@ -14,16 +14,17 @@
   12. Оперативний журнал переключень (стан комутаційних апаратів, блокування, хто/коли/за яким нарядом)
   13. GIS: імпорт/експорт схем мереж (GeoJSON, KML) замість демо-координат
   14. Метеомоніторинг підстанцій (вітер, ожеледь, грози) із прив'язкою до алертів
+  15. Темна / світла тема з перемикачем (CSS-тема, графіки Plotly, тайли карт; зберігається в URL ?theme=)
 
 Запуск:
     pip install streamlit pandas numpy plotly openpyxl sqlalchemy folium streamlit-folium
     # для PostgreSQL додатково: pip install psycopg2-binary
+    streamlit run security_ops_dashboard.py
 
 База даних:
     за замовчуванням — SQLite-файл ops_center.db поруч зі скриптом;
     для PostgreSQL задайте DATABASE_URL (змінна середовища або .streamlit/secrets.toml), напр.:
     postgresql://user:password@host:5432/opscenter
-    streamlit run security_ops_dashboard.py
 
 Дані у цій версії СИМУЛЬОВАНІ (генеруються в реальному часі).
 Щоб підключити реальні джерела, замініть функції-провайдери:
@@ -682,7 +683,7 @@ def render_security(window_min: int, threshold: int) -> None:
                 paper_bgcolor="rgba(0,0,0,0)",
                 legend=dict(orientation="h", y=-0.05),
             )
-            st.plotly_chart(fig, width="stretch", key="geo_map")
+            plotly_chart(fig, width="stretch", key="geo_map")
 
     # --- Динаміка
     with right:
@@ -708,7 +709,7 @@ def render_security(window_min: int, threshold: int) -> None:
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
             )
-            st.plotly_chart(fig2, width="stretch", key="auth_timeline")
+            plotly_chart(fig2, width="stretch", key="auth_timeline")
 
     # --- Сповіщення
     st.subheader("🚨 Сповіщення про підозрілу активність")
@@ -836,7 +837,7 @@ def render_infrastructure() -> None:
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
             )
-            st.plotly_chart(fig, width="stretch", key=key)
+            plotly_chart(fig, width="stretch", key=key)
 
     # Бекапи
     st.subheader("💾 Резервне копіювання")
@@ -1338,7 +1339,7 @@ def render_forecast() -> None:
     fig.update_yaxes(range=[max(0, lo), 105], title="%")
     fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.1),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, width="stretch", key="disk_forecast_chart")
+    plotly_chart(fig, width="stretch", key="disk_forecast_chart")
 
     st.subheader("🧪 Виявлення аномалій (z-score)")
     if an.empty:
@@ -2286,7 +2287,7 @@ def render_weather(role: str) -> None:
             from streamlit_folium import st_folium
 
             lats, lons = [n["lat"] for n in ss.nodes], [n["lon"] for n in ss.nodes]
-            m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True)
+            m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True, **map_tiles())
             if len(ss.nodes) >= 2:
                 m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
             for n in ss.nodes:
@@ -2327,9 +2328,118 @@ def render_weather(role: str) -> None:
     fig.update_yaxes(title_text="°C", secondary_y=True)
     fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), legend=dict(orientation="h", y=1.12),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, width="stretch", key="wx_chart")
+    plotly_chart(fig, width="stretch", key="wx_chart")
     st.caption("Пунктирна червона лінія — 20 м/с (поріг «високого» ризику за поривами). "
                "Пороги в assess_weather() варто узгодити з нормативами ваших ліній (типи опор, ожеледне навантаження).")
+
+
+# ----------------------------------------------------------------------------
+# Розділ 15: Тема оформлення (темна / світла)
+# ----------------------------------------------------------------------------
+DEFAULT_DARK = True  # для оперативного центру за замовчуванням темна; змініть на False для світлої
+
+THEME_VARS = {
+    True: {"bg": "#0e1117", "bg2": "#161b26", "card": "#1a2030", "fg": "#e6e9ef", "muted": "#9aa4b2",
+           "border": "#2b3445", "input": "#1b2231", "code": "#141a26"},
+    False: {"bg": "#ffffff", "bg2": "#f3f5f9", "card": "#f8f9fc", "fg": "#1f2937", "muted": "#6b7280",
+            "border": "#d5dbe5", "input": "#ffffff", "code": "#f3f4f6"},
+}
+
+
+def init_theme() -> None:
+    """Початкове значення теми: ?theme=dark|light в URL, інакше DEFAULT_DARK."""
+    ss = st.session_state
+    if "dark_theme" not in ss:
+        qp = st.query_params.get("theme")
+        ss.dark_theme = (qp == "dark") if qp in ("dark", "light") else DEFAULT_DARK
+
+
+def persist_theme() -> None:
+    st.query_params["theme"] = "dark" if st.session_state.get("dark_theme", DEFAULT_DARK) else "light"
+
+
+def is_dark() -> bool:
+    return bool(st.session_state.get("dark_theme", DEFAULT_DARK))
+
+
+def actual_theme() -> str | None:
+    """Тема, яку реально малює Streamlit (потрібна для полотняних таблиць). None — невідомо."""
+    try:
+        base = st.get_option("theme.base")
+        if base in ("light", "dark"):
+            return base
+    except Exception:
+        pass
+    try:
+        t = st.context.theme.type
+        return t if t in ("light", "dark") else None
+    except Exception:
+        return None
+
+
+def theme_css() -> str:
+    dark = is_dark()
+    v = THEME_VARS[dark]
+    # st.dataframe малюється на canvas за темою Streamlit: якщо вона відрізняється від обраної — інвертуємо
+    grid = '[data-testid="stDataFrame"], [data-testid="stDataFrameResizable"]'
+    flt = "filter: invert(0.92) hue-rotate(180deg);"
+    actual = actual_theme()
+    if actual is None:  # тему не визначено — орієнтуємось на системну (prefers-color-scheme)
+        other = "light" if dark else "dark"
+        grid_rule = f"@media (prefers-color-scheme: {other}) {{ {grid} {{ {flt} }} }}"
+    elif (actual == "dark") != dark:
+        grid_rule = f"{grid} {{ {flt} }}"
+    else:
+        grid_rule = ""
+    return f"""
+<style>
+:root {{ color-scheme: {'dark' if dark else 'light'}; }}
+.stApp, [data-testid="stAppViewContainer"] {{ background: {v['bg']}; color: {v['fg']}; }}
+[data-testid="stHeader"] {{ background: {v['bg']}; }}
+[data-testid="stHeader"] *, [data-testid="stToolbar"] * {{ color: {v['fg']}; }}
+[data-testid="stSidebar"], [data-testid="stSidebar"] > div {{ background: {v['bg2']}; }}
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp p, .stApp label, .stApp li,
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMetricValue"],
+.stApp [data-testid="stMetricLabel"], .stApp [data-testid="stWidgetLabel"] * {{ color: {v['fg']}; }}
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] * {{ color: {v['muted']}; }}
+.stApp hr {{ border-color: {v['border']}; }}
+.stApp input, .stApp textarea, .stApp [data-baseweb="select"] > div, .stApp [data-baseweb="input"] > div,
+.stApp [data-baseweb="textarea"] > div {{ background: {v['input']}; color: {v['fg']}; border-color: {v['border']}; }}
+.stApp [data-baseweb="select"] *, .stApp [data-baseweb="input"] * {{ color: {v['fg']}; }}
+[data-baseweb="popover"] > div, [data-baseweb="menu"], [data-baseweb="popover"] ul {{ background: {v['bg2']}; }}
+[data-baseweb="menu"] li, [data-baseweb="popover"] li, [role="option"] {{ color: {v['fg']}; }}
+.stApp .stButton > button, .stApp .stDownloadButton > button, .stApp [data-testid^="stBaseButton-secondary"] {{
+    background: {v['card']}; color: {v['fg']}; border: 1px solid {v['border']}; }}
+.stApp .stButton > button:hover, .stApp .stDownloadButton > button:hover {{ border-color: #3b82f6; }}
+.stApp [data-baseweb="tab-list"] button, .stApp [data-baseweb="tab-list"] button * {{ color: {v['fg']}; }}
+.stApp [data-baseweb="tab-border"] {{ background: {v['border']}; }}
+.stApp [data-testid="stExpander"] {{ background: {v['card']}; border-color: {v['border']}; }}
+.stApp [data-testid="stExpander"] summary, .stApp [data-testid="stExpander"] summary * {{ color: {v['fg']}; }}
+.stApp [data-testid="stForm"] {{ border-color: {v['border']}; }}
+.stApp [data-testid="stFileUploaderDropzone"] {{ background: {v['input']}; border-color: {v['border']}; }}
+.stApp [data-testid="stFileUploaderDropzone"] * {{ color: {v['fg']}; }}
+.stApp [data-testid="stCode"] pre, .stApp pre {{ background: {v['code']}; color: {v['fg']}; }}
+.stApp [data-testid="stAlert"] * {{ color: {v['fg']}; }}
+.stApp .svc-card {{ background: {v['card']}; border-color: {v['border']}; }}
+{grid_rule}
+</style>
+"""
+
+
+def map_tiles() -> dict:
+    """Параметри фонових тайлів folium відповідно до теми."""
+    style = "dark_all" if is_dark() else "light_all"
+    return {
+        "tiles": f"https://{{s}}.basemaps.cartocdn.com/{style}/{{z}}/{{x}}/{{y}}{{r}}.png",
+        "attr": "&copy; OpenStreetMap contributors &copy; CARTO",
+    }
+
+
+def plotly_chart(fig, **kwargs) -> None:
+    """st.plotly_chart із шаблоном поточної теми (theme=None, щоб Streamlit не перебивав кольори)."""
+    fig.update_layout(template="plotly_dark" if is_dark() else "plotly_white")
+    kwargs.setdefault("theme", None)
+    st.plotly_chart(fig, **kwargs)
 
 
 # ----------------------------------------------------------------------------
@@ -2687,7 +2797,7 @@ def render_ot_map(height: int = 430, key: str = "ot_map") -> None:
         return
 
     lats, lons = [p["lat"] for p in pts], [p["lon"] for p in pts]
-    m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True)
+    m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True, **map_tiles())
     if len(pts) >= 2:
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
 
@@ -2924,14 +3034,14 @@ def render_api(role: str) -> None:
         fig.add_vline(x=5, line_dash="dot", line_color="#ef4444")
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, width="stretch", key="api_err_chart")
+        plotly_chart(fig, width="stretch", key="api_err_chart")
     with c2:
         st.markdown("**Затримка p95, мс**")
         fig = px.bar(df, x="p95, мс", y="Шлюз / сервіс", orientation="h",
                      labels={"Шлюз / сервіс": ""})
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig, width="stretch", key="api_lat_chart")
+        plotly_chart(fig, width="stretch", key="api_lat_chart")
 
     st.subheader("🔧 Керування шлюзами")
     if not can_admin:
@@ -3383,7 +3493,7 @@ def render_assets(role: str) -> None:
     fig.update_yaxes(autorange="reversed")
     fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0),
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    st.plotly_chart(fig, width="stretch", key="asset_risk")
+    plotly_chart(fig, width="stretch", key="asset_risk")
 
     if not ROLES[role]["upload"]:
         st.info("Режим перегляду: змінювати статус активів можуть «Спеціаліст з ІБ» та «Адміністратор».")
@@ -3566,11 +3676,14 @@ def render_notifications(role: str) -> None:
 # ----------------------------------------------------------------------------
 def main() -> None:
     init_state()
-    st.markdown(CSS, unsafe_allow_html=True)
+    init_theme()
+    st.markdown(CSS + theme_css(), unsafe_allow_html=True)
 
     # --- Бічна панель
     with st.sidebar:
         st.header("⚙️ Налаштування")
+        st.toggle("🌙 Темна тема", key="dark_theme", on_change=persist_theme,
+                  help="Перемикає вигляд інтерфейсу, графіків і карт. Вибір зберігається в адресі (?theme=dark|light).")
         auto = st.toggle("Автооновлення (реальний час)", value=True)
         interval = st.slider("Інтервал оновлення, с", 2, 30, 5, disabled=not auto)
         window_min = st.select_slider(
