@@ -2095,7 +2095,7 @@ def demo_weather_node(name: str, scenario: str) -> pd.DataFrame:
     precip, snow, code = np.zeros(n), np.zeros(n), np.full(n, 2)
     sc = scenario
     if sc == "Випадковий":
-        sc = str(rng.choice(["Штиль", "Гроза", "Ожеледь", "Шторм"], p=[.55, .17, .14, .14]))
+        sc = str(rng.choice(["Штиль", "Гроза", "Ожеледь", "Шторм"], p=[.78, .09, .07, .06]))
     elif rng.random() > 0.7:
         sc = "Штиль"  # явний сценарій торкається ~70% вузлів
     s = int(rng.integers(2, 14))
@@ -2287,9 +2287,7 @@ def render_weather(role: str) -> None:
             from streamlit_folium import st_folium
 
             lats, lons = [n["lat"] for n in ss.nodes], [n["lon"] for n in ss.nodes]
-            m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True, **map_tiles())
-            if len(ss.nodes) >= 2:
-                m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+            m = new_map(lats, lons, width_px=700, height_px=400)
             for n in ss.nodes:
                 r = risks[n["name"]]
                 col = RISK_COLOR[r["level"]]
@@ -2427,12 +2425,40 @@ def theme_css() -> str:
 
 
 def map_tiles() -> dict:
-    """Параметри фонових тайлів folium відповідно до теми."""
-    style = "dark_all" if is_dark() else "light_all"
+    """Фонові тайли: стандартні OpenStreetMap (без API-ключа). Темна тема — CSS-фільтр у new_map()."""
     return {
-        "tiles": f"https://{{s}}.basemaps.cartocdn.com/{style}/{{z}}/{{x}}/{{y}}{{r}}.png",
-        "attr": "&copy; OpenStreetMap contributors &copy; CARTO",
+        "tiles": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attr": "&copy; OpenStreetMap contributors",
     }
+
+
+def new_map(lats: list[float], lons: list[float], width_px: int = 700, height_px: int = 430):
+    """Створює folium-карту з розрахованими центром і масштабом.
+
+    fit_bounds не використовується: у прихованій вкладці контейнер має нульовий розмір,
+    і Leaflet «віддаляє» карту до всього світу."""
+    import folium
+
+    lat_c, lon_c = (min(lats) + max(lats)) / 2, (min(lons) + max(lons)) / 2
+    span_lon = max(max(lons) - min(lons), 0.02)
+    span_lat = max(max(lats) - min(lats), 0.02)
+    pad = 0.8  # запас по краях, щоб маркери не обрізались
+    z_lon = np.log2(pad * width_px * 360 / (256 * span_lon))
+    z_lat = np.log2(pad * height_px * 360 * max(np.cos(np.radians(lat_c)), 0.2) / (256 * span_lat))
+    zoom = int(np.clip(np.floor(min(z_lon, z_lat) + 0.15), 3, 14))
+    m = folium.Map(location=[lat_c, lon_c], zoom_start=zoom, control_scale=True, **map_tiles())
+
+    css = ".leaflet-container{background:%s;}" % ("#1b1f27" if is_dark() else "#e5e7eb")
+    if is_dark():  # затемнення растрових тайлів
+        css += ".leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.92) contrast(.88);}"
+    m.get_root().header.add_child(folium.Element(f"<style>{css}</style>"))
+    # якщо карту відрисовано у прихованій вкладці — перерахувати розмір, коли вона стане видимою
+    js = ("window.addEventListener('load',function(){var mp=window['%s'];if(!mp)return;"
+          "setTimeout(function(){mp.invalidateSize();},200);"
+          "if(window.ResizeObserver){new ResizeObserver(function(){mp.invalidateSize();}).observe(document.body);}});"
+          % m.get_name())
+    m.get_root().script.add_child(folium.Element(js))
+    return m
 
 
 def plotly_chart(fig, **kwargs) -> None:
@@ -2683,7 +2709,7 @@ def tick_ot() -> None:
             resolve_links(link)
 
     # програмні збої у ПЗ диспетчерів та бригад
-    if rng.random() < 0.22:
+    if rng.random() < 0.08:
         src, sev, msg = ALERT_TEMPLATES[int(rng.integers(len(ALERT_TEMPLATES)))]
         add_alert(src, sev, msg.format(n=int(rng.integers(1, 25))))
 
@@ -2797,9 +2823,7 @@ def render_ot_map(height: int = 430, key: str = "ot_map") -> None:
         return
 
     lats, lons = [p["lat"] for p in pts], [p["lon"] for p in pts]
-    m = folium.Map(location=[float(np.mean(lats)), float(np.mean(lons))], zoom_start=8, control_scale=True, **map_tiles())
-    if len(pts) >= 2:
-        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
+    m = new_map(lats, lons, width_px=700 if height <= 450 else 1100, height_px=height)
 
     layers = [L for L in ss.get("gis_layers", []) if L.get("visible", True)]
     for L in layers:  # імпортовані шари GeoJSON/KML
@@ -3629,7 +3653,9 @@ def process_new_alerts() -> None:
     cfg = ss.ext_cfg
     new = [a for a in ss.alerts if a["id"] > cfg["last_alert_id"]]
     for a in new:
-        if cfg["auto_incident"] and a["severity"] == "Критично":
+        dup = any(i["title"] == a["message"] and i["status"] != "Закрито" for i in ss.incidents)
+        if (cfg["auto_incident"] and a["severity"] == "Критично"
+                and a["source"] != "Метеомоніторинг" and not dup):  # прогноз погоди — не інцидент
             create_incident(a["message"], a["severity"], alert_id=a["id"])
         if SEV_ORDER[a["severity"]] <= SEV_ORDER[cfg["notify_min"]]:
             notify(f"[{a['severity']}] {a['source']}: {a['message']}", a["severity"])
@@ -3707,6 +3733,9 @@ def main() -> None:
         st.subheader("🗄️ Сховище даних")
         db_ok, db_info = db_status()
         st.caption(f"✅ Збереження увімкнено: {db_info}" if db_ok else f"⚠️ {db_info}")
+        if db_ok and db_info == "sqlite":
+            st.caption("SQLite-файл у хмарі (Streamlit Community Cloud) скидається при перезапуску застосунку. "
+                       "Для постійного збереження задайте DATABASE_URL (PostgreSQL) у Secrets.")
         if role == "Адміністратор" and db_ok:
             with st.expander("Небезпечна зона"):
                 wipe_ok = st.checkbox("Підтверджую повне очищення БД", key="db_wipe_ok")
