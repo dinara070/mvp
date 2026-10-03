@@ -6,5 +6,4 @@ openpyxl
 sqlalchemy
 folium
 streamlit-folium
-# потрібен лише для PostgreSQL (DATABASE_URL=postgresql://...)
 psycopg2-binary
